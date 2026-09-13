@@ -1,3 +1,5 @@
+![ScotMesh Reticulum](https://raw.githubusercontent.com/ScotMesh/branding/main/networks/reticulum/readme-header.png)
+
 # microReticulum_Firmware — ScotMesh fork
 
 > **This is ScotMesh's fork** of [attermann/microReticulum_Firmware](https://github.com/attermann/microReticulum_Firmware).
@@ -12,7 +14,7 @@
 |---|---|---|
 | **Seeed SenseCAP Solar Node P1** | not supported | New target `seeed_solar_node_p1` (`BOARD_SEEED_P1 0x53`): XIAO nRF52840 Plus + Wio-SX1262, solar charger, 5 000 mAh battery. Pins, RF switch, TCXO, LEDs and button in `Boards.h`; variant under `variants/seeed_solar_node_p1/`. Provisioned as RAK4631-class (`product 0x10`, `model 0x11/0x12`) so `rnodeconf`, Sideband and the flasher accept it. |
 | **SoftDevice S140 v7.3.0 layout** | assumes S140 v6 (app at `0x26000`) | The P1 ships v7.3.0 (app at `0x27000`). `Device.h` reads the SoftDevice size from flash to find the application start and sizes the self-hash from the linker, so the firmware hash check works on both layouts. Linker script `boards/nrf52840_s140_v7.ld`, headers `lib/nrf52/s140_nrf52_7.3.0_API/`. |
-| **External flash store** | internal FS only on nRF52 | QSPI P25Q16H on the P1 mounted as LittleFS through [A13xB0/microStore#qspi-transport](https://github.com/A13xB0/microStore/tree/qspi-transport); larger path table (500 entries). |
+| **External flash store** | internal FS only on nRF52 | QSPI P25Q16H on the P1 mounted as LittleFS through [ScotMesh/microStore#qspi-transport](https://github.com/ScotMesh/microStore/tree/qspi-transport); larger path table (500 entries). |
 | **Battery** | not measured on nRF52 boards without a PMU | P1 reads VBAT through the on-board divider (`Power.h`), answers `CMD_STAT_BAT` over KISS and exposes volts / % / charging in the Provisioning **Metrics** namespace. |
 | **UF2 output** | DFU zip only | `seeed_*` targets also emit a `.uf2` for drag-and-drop onto the bootloader drive (`tools/uf2conv.py`). |
 | **Releases** | built by hand | `.github/workflows/release.yml` — a **manual dispatch** builds every board, writes `release.json`, packages the web console and publishes a GitHub release. rnode.scotmesh.net mirrors the assets hourly for the browser flasher. |
