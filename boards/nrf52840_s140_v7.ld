@@ -35,4 +35,16 @@ SECTIONS
   } > RAM
 } INSERT AFTER .data;
 
+/* RAM that the startup code does not zero: the hard-fault record
+   (FaultDump.h) has to survive NVIC_SystemReset. Sits between .bss and
+   .heap, so __HeapBase moves up by its size. */
+SECTIONS
+{
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    KEEP(*(.noinit*))
+  } > RAM
+} INSERT AFTER .bss;
+
 INCLUDE "nrf52_common.ld"
