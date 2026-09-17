@@ -1050,8 +1050,15 @@ void setup() {
       if (filesystem.init()) {
         TRACE("Initialized P25Q16H QSPI flash");
         init_success = true;
-        // 2 MiB: raise path store limits as for the RAK external flash modules
-        RNS::Transport::path_table_maxsize(500);
+        // 2 MiB of flash, but the path store's index lives in RAM: every
+        // record costs a FileStore index entry plus a _path_states entry,
+        // about 140 bytes together. The 500 copied from the RAK modules was
+        // sized for their flash, and measured at 446-479 records here — some
+        // 65 KB of a 140 KB pool, which is the whole 104 KB baseline this node
+        // booted with before it ran out of memory 30 hours later. 150 records
+        // is ~21 KB and still far more than this node routes to; the store is
+        // LRU, so the paths in use are the ones it keeps.
+        RNS::Transport::path_table_maxsize(150);
         RNS::Transport::path_store_segment_size(24576);
         RNS::Transport::path_store_segment_count(8);
       }
