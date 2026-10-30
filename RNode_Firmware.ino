@@ -753,6 +753,14 @@ void setup() {
       delay(100);
     #endif
 
+    #if BOARD_MODEL == BOARD_SEEED_P1
+      // The battery keeps the SX1262 powered across MCU resets and reflashes,
+      // so its registers keep whatever the last firmware wrote. preInit()
+      // identifies the chip by the power-on sync word, so reset it first.
+      LoRa->reset();
+      delay(10);
+    #endif
+
     // Check installed transceiver chip and
     // probe boot parameters.
     #if MCU_VARIANT == MCU_NATIVE
