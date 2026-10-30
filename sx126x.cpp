@@ -453,6 +453,15 @@ int sx126x::begin(uint32_t frequency) {
   if (!_preinit_done) { if (!preInit()) { return false; } }
   if (_rxen != -1) { pinMode(_rxen, OUTPUT); }
 
+  #if BOARD_MODEL == BOARD_SEEED_P1
+    // On the Wio-SX1262 the DIO3-powered TCXO fails to start under transmit
+    // load with the reset-default LDO regulator (GetDeviceErrors reports
+    // XOSC_START_ERR after the first TX). Use the DC-DC regulator, as
+    // RadioLib/Meshtastic do on this module.
+    uint8_t regulator_mode = 0x01;
+    executeOpcode(OP_REGULATOR_MODE_6X, &regulator_mode, 1);
+  #endif
+
   calibrate();
   calibrate_image(frequency);
   enableTCXO();
