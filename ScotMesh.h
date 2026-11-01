@@ -134,6 +134,7 @@
 #endif
 static uint32_t sm_links_closed_stuck = 0, sm_links_closed_idle = 0, sm_links_closed_mem = 0;   // sm_links_watchdog(), shown on Health and /api/sys
 #define SM_DFU_MAGIC     0x5D     // GPREGRET2 value asking the next boot for a BLE update window
+#define SM_TXFAIL_MAGIC  0x7F     // GPREGRET2 value: restarted after a failed transmit (tx_fail_reset)
 #define SM_DFU_WINDOW_MS (20UL * 60UL * 1000UL)
 #define SM_TRIAL_MS      (5UL * 60UL * 1000UL)
 // Forgetting paired phones needs bond storage: nRF52 (Bluefruit) and ESP32 BLE; not ESP32 classic Bluetooth
@@ -224,6 +225,11 @@ static void sm_load() {
 // Runtime state (RAM, all capped)
 // ---------------------------------------------------------------------------
 static const char* sm_reset_reason = "power-on";
+#if MCU_VARIANT == MCU_NRF52
+  // Restarts after a failed transmit, kept across restarts in its own file.
+  static const char* SM_TXF_PATH = "/scotmesh.txf";
+  static uint32_t sm_txfails = 0;
+#endif
 static uint64_t sm_up_ms = 0; static uint32_t sm_last_millis = 0;
 static uint32_t sm_blink_until = 0, sm_dfu_action = 0, sm_dfu_action_at = 0;
 struct SmRadio { uint32_t f, bw; int sf, cr, txp; };
@@ -475,7 +481,7 @@ void sm_early_boot() {
   if (RNS::Utilities::OS::file_exists(SM_WIPE_PATH)) {
     printf("[scotmesh] full reset: wiping identity, routes, known identities and settings\n");
     for (const char* d : {"./path_store", "./known_store", "./hashlist_store", "./cache"}) sm_wipe_dir(d);
-    for (const char* f : {"./transport_identity", "./destination_table", "./tunnels", SM_CFG_PATH, SM_LOG_PATH, SM_HIST_PATH, SM_LOC_PATH, "/scotmesh.key", SM_WIPE_PATH}) if (RNS::Utilities::OS::file_exists(f)) RNS::Utilities::OS::remove_file(f);
+    for (const char* f : {"./transport_identity", "./destination_table", "./tunnels", SM_CFG_PATH, SM_LOG_PATH, SM_HIST_PATH, SM_LOC_PATH, "/scotmesh.key", "/scotmesh.txf", SM_WIPE_PATH}) if (RNS::Utilities::OS::file_exists(f)) RNS::Utilities::OS::remove_file(f);
   }
 #if defined(SCOTMESH_WIFI_UPDATE)
   sm_update_mode();
@@ -1405,7 +1411,11 @@ static void pg_power(const RNS::Bytes& rid) {
 static void pg_health() {
   Ph("Health");
   P(DIM("RAM") " %u KB free, flash %u KB\n", (unsigned)(RNS::Utilities::Memory::heap_available() / 1024), (unsigned)(RNS::Utilities::OS::storage_available() / 1024));
-  P(DIM("Up") " %s, %lu starts (%s)\n", sm_up(), (unsigned long)sm.reboots, sm_reset_reason);
+  P(DIM("Up") " %s, %lu starts (%s)", sm_up(), (unsigned long)sm.reboots, sm_reset_reason);
+#if MCU_VARIANT == MCU_NRF52
+  P(", %lu tx-fail", (unsigned long)sm_txfails);
+#endif
+  P("\n");
   P(DIM("Radio") " noise %d, last %d/%ddB\n", noise_floor, last_rssi, (int)((int8_t)last_snr_raw) / 4);
   P(DIM("Air") " %.1f%% now, %.1f%% avg\n", airtime * 100, longterm_airtime * 100);
   P(DIM("Pkts") " rx %lu, tx %lu\n", (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0));
@@ -1871,6 +1881,9 @@ static void J_ram() {
     (unsigned)RNS::Utilities::Memory::heap_pool_free(), (unsigned)RNS::Utilities::Memory::heap_pool_fragmented());
   P(",\"links_closed_stuck\":%lu,\"links_closed_idle\":%lu,\"links_closed_mem\":%lu",
     (unsigned long)sm_links_closed_stuck, (unsigned long)sm_links_closed_idle, (unsigned long)sm_links_closed_mem);
+#if MCU_VARIANT == MCU_NRF52
+  P(",\"tx_fail\":%lu", (unsigned long)sm_txfails);
+#endif
 }
 #ifdef HAS_ENV_SENSORS
 static void J_env() {
@@ -2089,6 +2102,11 @@ void sm_boot() {
 #if MCU_VARIANT == MCU_NRF52
   uint32_t rr = readResetReason();
   sm_reset_reason = rr == 0 ? "power-on" : (rr & POWER_RESETREAS_DOG_Msk) ? "watchdog" : (rr & POWER_RESETREAS_SREQ_Msk) ? "soft-reset" : (rr & POWER_RESETREAS_LOCKUP_Msk) ? "lockup" : (rr & POWER_RESETREAS_RESETPIN_Msk) ? "reset-pin" : (rr & POWER_RESETREAS_OFF_Msk) ? "wake" : "other";
+  { RNS::Bytes b; if (RNS::Utilities::OS::file_exists(SM_TXF_PATH) && RNS::Utilities::OS::read_file(SM_TXF_PATH, b) == sizeof(sm_txfails)) memcpy(&sm_txfails, b.data(), sizeof(sm_txfails)); }
+  if (sm_txfail_boot) {   // the soft reset was tx_fail_reset(): say so, and count it
+    sm_reset_reason = "tx-fail"; sm_txfails++;
+    RNS::Utilities::OS::write_file(SM_TXF_PATH, RNS::Bytes((const uint8_t*)&sm_txfails, sizeof(sm_txfails)));
+  }
 #elif MCU_VARIANT == MCU_ESP32
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON: sm_reset_reason = "power-on"; break; case ESP_RST_SW: sm_reset_reason = "soft-reset"; break; case ESP_RST_PANIC: sm_reset_reason = "panic"; break;

@@ -66,47 +66,56 @@
 <details>
 <summary><kbd>I</kbd> <code>/page/index.mu</code> &mdash; Home</summary>
 <div class="screen"><span class="hd">Hilltop</span>
+<span class="dim">Op</span> Hilltop radio club
 
-<span class="sub">Status</span>
-▇▇▇▇▇▇▇▇▇░ 94% 4.09V ▲
-<span class="dim">Up</span> 5h 52m, <span class="lnk">14 routes</span>
-<span class="dim">Radio</span> 869.463 SF8 125k, 2.4% air
+  <span class="sub">Status</span>
+  ▇▇▇▇▇▇▇▇▇░ 94% 4.09V <span class="ok">▲</span>
+  <span class="dim">Up</span>    5h 52m, <span class="lnk">14 routes</span>
+  <span class="dim">Radio</span> 869.463 SF8 125k, 2.4% air
+
+<span class="dim">Your link</span> direct, SNR 14.2 dB
 <div class="div"></div>
-<span class="lnk">Admin</span>
-Verified identity: 39781539a2bd1c84
-Your link direct, SNR 14.2 dB
-<div class="div"></div>
-ScotMesh microReticulum
+&#127475;&#127473; Reticulum Amsterdam
+&#127988;&#917607;&#917602;&#917619;&#917603;&#917620;&#917631; ScotMesh microReticulum
 v1.86-scotmesh-dev &middot; SenseCAP P1</div>
+<p class="screen-caption">Visitor view, not identified. Identified visitors also see "Verified identity"; admins see every row (rows hidden from visitors marked <code>*</code>), an Admin link, and always the full footer.</p>
 <p>The node's landing page &mdash; whatever the operator has chosen to make public.</p>
 <ul>
-  <li>Node name, battery gauge (10-block bar, %, voltage, charge arrow)</li>
-  <li>Uptime, path count (links to Routes), radio freq/SF, live airtime %, operator note</li>
+  <li>Node name, with the operator note right under it</li>
+  <li>Battery gauge (10-block bar, %, voltage) with <span style="color:#2ecc55">▲</span> charging, <span style="color:#2ecc55">●</span> full, <span style="color:#ddaa33">▼</span> on battery</li>
+  <li>Uptime, path count (links to Routes), radio freq/SF, live airtime %, aligned under "Status"</li>
   <li>"Admin" link if you're already registered, or "Register" if password sign-up is on</li>
-  <li>Verified-identity line, firmware + board footer</li>
+  <li>Verified-identity line, only if you identified (nothing for anonymous visitors)</li>
+  <li>Footer: the operator's own flag/text line, the ScotMesh credit, firmware + board &mdash; the last two can be hidden from visitors</li>
 </ul>
 <p><mark>Visitor view is configurable</mark> on the Settings &rarr; Home page.</p>
 </details>
 
 <details>
 <summary><kbd>r</kbd> <code>/page/r.mu</code> &mdash; Routes</summary>
-<div class="screen"><span class="hd">Routes</span> <span class="dim">14 &middot; hops &middot; heard &middot; name?</span>
-3f8a2c91 1 2m
-7bd04e5a 2 4m Hilltop-Relay
-a19cc038 1 9m
-c3e812f0 3 21m
-<span class="lnk">Neighbours</span>  <span class="lnk">Home</span></div>
-<p>The node's path table: destination hash &middot; hop count &middot; last heard, 10 rows per page, short or full hash display.</p>
+<div class="screen"><span class="hd">Routes &middot; 14 known</span>
+<span class="dim">dest     hops heard  name</span>
+3f8a2c91    1    2m
+7bd04e5a    2    4m  Hilltop-Relay
+a19cc038    1    9m
+c3e812f0    3   21m
+<span class="dim">1-4/14</span> <span class="lnk">next</span>
+Short [x] Rows [10] <span class="lnk">Apply</span>
+<span class="lnk">Neighbours</span>  <span class="lnk">Visitors</span>  <span class="lnk">Device</span>  <span class="lnk">Home</span></div>
+<p>The node's path table as a table: a dim header row (dest &middot; hops &middot; heard &middot; name) over aligned rows; the name only for destinations that are also direct neighbours. Up to 10 rows per page &mdash; fewer when the one-packet page runs out of room, the rest under "next". Short (default) shows 8-character hashes, unticked the full 32 for every row. Visitors and Device links only for admins.</p>
 </details>
 
 <details>
 <summary><kbd>b</kbd> <code>/page/b.mu</code> &mdash; Neighbours</summary>
-<div class="screen"><span class="hd">Neighbours</span> <span class="dim">heard &middot; name</span>
-3f8a2c91 2m
-7bd04e5a 4m Hilltop-Relay
-e02bb711 15m
-<span class="lnk">Routes</span>  <span class="lnk">Home</span></div>
-<p>Peers this node has heard announce: destination hash &middot; time since heard &middot; name, paginated.</p>
+<div class="screen"><span class="hd">Neighbours &middot; 3 heard</span>
+<span class="dim">node     heard  name</span>
+3f8a2c91    2m
+7bd04e5a    4m  Hilltop-Relay
+e02bb711   15m
+<span class="dim">1-3/3</span>
+Short [x] Rows [10] <span class="lnk">Apply</span>
+<span class="lnk">Routes</span>  <span class="lnk">Visitors</span>  <span class="lnk">Device</span>  <span class="lnk">Home</span></div>
+<p>Peers this node has heard announce, as a table: node &middot; heard &middot; name, paginated. Routes and Neighbours link to each other; admins also get Visitors and Device links.</p>
 </details>
 
 <details>
@@ -175,7 +184,7 @@ Announce every  (&bull;)30m ( )1h ( )3h ( )6h ( )12h
 Flag     [NL] <span class="dim">country code, e.g. NL</span>
 Footer   [Reticulum Amsterdam    ]
 
-<span class="lnk">Save</span>   &lt; <span class="lnk">Admin</span></div>
+<span class="lnk">Save</span>   &lt; <span class="lnk">Settings</span></div>
 <ul>
   <li>Node name (32 chars), operator note (22 chars)</li>
   <li>Announce interval: 30m / 1h / 3h / 6h / 12h</li>
@@ -196,9 +205,11 @@ Footer   [Reticulum Amsterdam    ]
 [ ] Operator
 [x] Routes pages
 [x] Visitor's link (hops, signal)
-<span class="lnk">Save</span>  <span class="lnk">Preview</span>  &lt; <span class="lnk">Admin</span></div>
+[x] ScotMesh credit
+[x] Firmware &amp; board
+<span class="lnk">Save</span>  <span class="lnk">Preview</span>  &lt; <span class="lnk">Settings</span></div>
 <ul>
-  <li>Checkboxes for what a visitor sees: battery, uptime, radio, paths, airtime, operator, routes-link</li>
+  <li>Checkboxes for what a visitor sees: battery, uptime, radio, paths, airtime, operator, routes-link, visitor's link, ScotMesh credit, firmware &amp; board (admins always see everything; <code>*</code> marks rows hidden from visitors)</li>
   <li>"Preview" link &mdash; see the visitor view live</li>
 </ul>
 </details>
@@ -211,7 +222,7 @@ Paste from Google Maps:
 Height [310  ]m  (&bull;)Exact ( )~1 km
 [ ] Publish on rmap.world
 <span class="dim">Not sent yet</span>
-<span class="lnk">Save</span>  &lt; <span class="lnk">Admin</span></div>
+<span class="lnk">Save</span>  &lt; <span class="lnk">Settings</span></div>
 <ul>
   <li>Paste a coordinate (lat, lon) + height in metres</li>
   <li>Exact or ~1&nbsp;km-rounded precision, publish on/off</li>
@@ -227,7 +238,7 @@ SF [8 ] CR [5 ] dBm [20]
 <span class="lnk">Try these</span>
 <span class="dim">Preset:</span> <span class="lnk">ScotMesh 868</span> <span class="lnk">433</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Settings</span></div>
 <ul>
   <li>Current frequency, bandwidth, SF, CR, TX power</li>
   <li>Two one-tap presets: ScotMesh 868 / 433</li>
@@ -243,7 +254,7 @@ SF [8 ] CR [5 ] dBm [20]
 ( ) Mobile <span class="dim">ROAMING</span>
 ( ) End device <span class="dim">transport off</span>
 <span class="dim">Relays forward for others; end devices never do.</span>
-<span class="lnk">Save</span>  &lt; <span class="lnk">Admin</span></div>
+<span class="lnk">Save</span>  &lt; <span class="lnk">Settings</span></div>
 <ul>
   <li>Fixed relay &middot; Access point &middot; Mobile &middot; End device</li>
   <li>Relays forward traffic for others; end devices never do</li>
@@ -259,12 +270,16 @@ Below [25]% battery:
 ( ) Radio off until charged
 (&bull;) Nothing
 [x] Radio off below 3.3 V
+<span class="lnk">Save</span>
 
-<span class="lnk">Save</span>  &lt; <span class="lnk">Admin</span></div>
+Reads 4.16 V <span class="dim">x1.017</span>
+Meter [     ] V <span class="lnk">Calibrate</span> <span class="lnk">Reset</span>
+&lt; <span class="lnk">Settings</span></div>
 <ul>
   <li>Battery-% threshold (5&ndash;60%), action below it: lower TX to 10&nbsp;dBm, radio off until charged, or nothing</li>
   <li>Separate hard cutoff: radio off below 3.3&nbsp;V</li>
   <li>Live flag if a limit is currently in effect</li>
+  <li>Battery calibration (boards that read the battery through an ADC, e.g. Solar Node P1, Heltec V3/V4, RAK4631): shows what the node reads; measure the pack with a multimeter, type that voltage into Meter and press Calibrate, at the same moment. The node stores meter &divide; its own reading (within &plusmn;10&nbsp;%, shown as e.g. <code>x1.017</code>) and applies it to every reading from then on: voltage, percentage, charging, alerts, power thresholds. Reset goes back to the board's built-in scale. Survives updates and a full reset (it belongs to the hardware)</li>
 </ul>
 </details>
 
@@ -292,7 +307,7 @@ Below [25]% battery:
 <span class="lnk">c3e812f009a7bb44&hellip;</span>
 <span class="dim">Add</span> [                                ] <span class="lnk">Add</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Access</span></div>
 <ul>
   <li>Up to 8 admin identity hashes, your own row marked "you"</li>
   <li>Add by pasting a 32-hex identity hash</li>
@@ -307,7 +322,7 @@ Below [25]% battery:
 [x] On   [ ] Needs approval
 New   [            ]
 Again [            ] blank=keep
-<span class="lnk">Save</span>  &lt; <span class="lnk">Admin</span>
+<span class="lnk">Save</span>  &lt; <span class="lnk">Access</span>
 
 <span class="sub">Last attempt</span>
 wrong 1/3</div>
@@ -329,7 +344,7 @@ wrong 1/3</div>
 <span class="dim">7bd04e5a91ffac22&hellip;</span>
 <span class="lnk">older</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Access</span></div>
 <p>Last 32 admin actions: how long ago, what happened, which identity.</p>
 </details>
 
@@ -352,6 +367,7 @@ c3e812f009a7bb44c81f0e3d22ab9910
 <summary><kbd>d</kbd> <code>/page/d.mu</code> &mdash; Device hub</summary>
 <div class="screen"><span class="hd">Device</span>
 <span class="lnk">Health</span>
+<span class="lnk">Routes</span>  <span class="lnk">Neighbours</span>  <span class="lnk">Visitors</span>
 <span class="lnk">Lights &amp; Bluetooth</span> <span class="dim">lights on</span>
 <span class="lnk">Logs</span>
 <span class="lnk">Maintenance</span>
@@ -359,26 +375,40 @@ c3e812f009a7bb44c81f0e3d22ab9910
 <span class="lnk">About</span>
 
 &lt; <span class="lnk">Admin</span></div>
-<p>Menu into the five pages below.</p>
+<p>Menu into the pages below, plus one row linking Routes, Neighbours and Visitors.</p>
 </details>
 
 <details>
 <summary><kbd>e</kbd> <code>/page/e.mu</code> &mdash; Health</summary>
 <div class="screen"><span class="hd">Health</span>
 <span class="dim">RAM</span> 128 KB free, flash 980 KB
-<span class="dim">Up</span> 5h 52m, 7 starts (power-on)
+<span class="dim">Up</span> 5h 52m, 7 starts (power-on), 0 tx-fail
 <span class="dim">Radio</span> noise -108, last -22/14dB
 <span class="dim">Air</span> 2.4% now, 1.9% avg
 <span class="dim">Pkts</span> rx 2225, tx 1697
 <span class="dim">Tables</span> paths 14/500, ann 22
 known 31, links 10, nbrs 9
+<span class="dim">Closed</span> stuck 3, idle 19, mem 0
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Device</span></div>
 <ul>
-  <li>Free RAM / flash, uptime, boot count, last reset reason</li>
+  <li>Free RAM / flash, uptime, boot count, last reset reason, and on nRF52 boards how many restarts followed a failed transmit (reason "tx-fail")</li>
   <li>Radio noise floor, last RSSI/SNR, current + average airtime %</li>
   <li>Packets rx/tx, path/announce/known-destination/link/neighbour table sizes</li>
+  <li>Links the watchdog closed since boot: unfinished handshakes (stuck), nothing received for 725&nbsp;s (idle), or to free memory (mem)</li>
 </ul>
+</details>
+
+<details>
+<summary><kbd>v</kbd> <code>/page/v.mu</code> &mdash; Visitors</summary>
+<div class="screen"><span class="hd">Visitors &middot; 3 open</span>
+<span class="dim">link      idle  hops  who</span>
+87a014b0    11m     2  anon <span class="dim">via</span> Hilltop-Relay
+9b7e3a10     6m     1  anon <span class="dim">h</span>
+2283af27     0m     1  Jane Mobile
+<span class="dim">1-3/3</span>
+<span class="lnk">Routes</span>  <span class="lnk">Neighbours</span>  <span class="lnk">Device</span>  <span class="lnk">Home</span></div>
+<p>Admin only. Who has a link open to the node right now, as a table, longest idle first (those are closed first by the link watchdog, after 725&nbsp;s with nothing received): short link id &middot; idle (time since anything was received) &middot; hops &middot; who. "who" is the visitor's announced name if they identified themselves, else their short identity hash, else "anon". 2+ hop links add "via" and the repeater they come through ("?" = guessed by signal). A dim letter marks links not yet active (p, h) or stale (s). Up to 10 per page. Same data as <code>/api/links</code>.</p>
 </details>
 
 <details>
@@ -390,7 +420,7 @@ known 31, links 10, nbrs 9
 <span class="sub">Bluetooth</span>
 (&bull;) On ( ) Off  <span class="lnk">Save</span>  <span class="lnk">Unpair all</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Device</span></div>
 <ul>
   <li>LED mode: on / off / first 10 min only &mdash; errors always show regardless</li>
   <li>"Blink for 30s" locator action</li>
@@ -407,7 +437,7 @@ known 31, links 10, nbrs 9
 [bt] advertising started
 [provision] config committed
 
-<span class="lnk">Refresh</span>  &lt; <span class="lnk">Admin</span></div>
+<span class="lnk">Refresh</span>  &lt; <span class="lnk">Device</span></div>
 <p>Last 5 log lines, with a refresh action.</p>
 </details>
 
@@ -422,7 +452,7 @@ known 31, links 10, nbrs 9
 <span class="sub">Reset</span>
 <span class="lnk">Clear routes &amp; data</span>  <span class="lnk">Factory reset</span>  <span class="lnk">Full reset</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Device</span></div>
 <p>"Announce now", auto-restart schedule: off / daily / weekly.</p>
 <p><mark>Confirm-gated resets: clear routes &amp; data, factory reset, full reset.</mark></p>
 </details>
@@ -437,7 +467,7 @@ Up 5h 52m   <span class="lnk">Restart</span>
 <span class="lnk">Bluetooth update</span>
 <span class="lnk">USB bootloader</span>
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Device</span></div>
 <ul>
   <li>Restart (confirm-gated, ~15s offline)</li>
   <li>nRF52: Bluetooth DFU or USB-bootloader window &mdash; ESP32 (with a spare app slot): 20-min WiFi update AP <code>ScotMesh-Update</code> with a one-time password; upload the <code>.bin</code> at <code>http://10.73.73.1</code>, with a progress bar</li>
@@ -458,11 +488,11 @@ v1.86-scotmesh-dev &middot; SenseCAP P1
 <span class="dim">LXMF (alerts)</span>
 8f6b8085f68a2a7c147ea68c9c12e054
 <span class="dim">LXMF in 4, out 2, last:</span>
-2026-10-25 09:12
+sent to 39781539
 <span class="dim">Probe</span>
 c3e812f009a7bb44c81f0e3d22ab9910
 
-&lt; <span class="lnk">Admin</span></div>
+&lt; <span class="lnk">Device</span></div>
 <p>Firmware tag, board name, transport/management/NomadNet/probe destination hashes, and on nodes with LXMF alerts the node's LXMF address (the one to add as a contact).</p>
 </details>
 
@@ -547,14 +577,15 @@ c3e812f009a7bb44c81f0e3d22ab9910
 <tr><td><code>/api/up</code></td><td>uptime, reset</td><td></td></tr>
 <tr><td><code>/api/net</code></td><td>routes, neighbours, rx, tx, links</td><td></td></tr>
 <tr><td><code>/api/radio</code></td><td>freq, bw, sf, cr, txp, airtime, noise, rssi, snr</td><td></td></tr>
-<tr><td><code>/api/sys</code></td><td>fw, board, name, free_ram, free_flash</td><td></td></tr>
+<tr><td><code>/api/sys</code></td><td>fw, board, name, free_ram, free_flash, free_pool, pool_fragmented, links_closed_stuck, links_closed_idle, links_closed_mem, tx_fail</td><td><code>free_pool</code>/<code>pool_fragmented</code>: the Reticulum memory pool, 0 on boards without one (Heltec V4). <code>links_closed_*</code>: links the watchdog closed since boot, as unfinished handshakes, after 725 s with nothing received, or to free memory. <code>tx_fail</code> (nRF52 boards): restarts after a failed transmit, kept across restarts.</td></tr>
 <tr><td><code>/api/health</code></td><td>free_ram, free_flash, reboots, reset, paths, paths_max, announces, neighbours</td><td></td></tr>
 <tr><td><code>/api/pos</code></td><td>lat, lon, height</td><td>Errors if the map page hasn't published a position.</td></tr>
-<tr><td><code>/api/paths</code></td><td>total, o, cols: [dest,hops,age_s,via], rows: [&hellip;]</td><td>Paginate with <code>?o=</code>/<code>?n=</code>, short hashes with <code>?s=1</code>.</td></tr>
+<tr><td><code>/api/paths</code></td><td>total, o, cols: [dest,hops,age_s,via], rows: [&hellip;]</td><td>Paginate with <code>o</code> (skip) and <code>n</code> (rows), short hashes with <code>s=1</code>. Not a <code>?</code> query string: send them as request-data keys, or in a NomadNet browser as link variables, e.g. <code>:/api/paths`s=1|n=10</code>. A path with <code>?</code> in it has no handler and times out.</td></tr>
 <tr><td><code>/api/nbrs</code></td><td>total, o, cols: [dest,age_s,name], rows: [&hellip;]</td><td>Same pagination as <code>/api/paths</code>.</td></tr>
+<tr><td><code>/api/links</code></td><td>total, o, cols: [link,st,age_s,in_s,hops,rssi,who,name,via], rows: [&hellip;]</td><td>Open links, longest silent first. <code>st</code>: p(ending), h(andshake), a(ctive), s(tale), c(losed). <code>in_s</code>: seconds since anything was received on it. <code>hops</code>/<code>rssi</code> from the last packet on it, <code>null</code> if no longer tracked. <code>who</code>: the visitor's identity if it identified itself, else <code>null</code>. <code>name</code>: that visitor's announced LXMF or NomadNet name, if known. <code>via</code>: for 2+ hop links, the repeater that delivers it (name, else short hash); a trailing <code>?</code> means guessed from signal strength. <code>who</code>, <code>name</code> and <code>via</code> are admin only (as on the Visitors page): for anyone else they are <code>null</code>. Same pagination as <code>/api/paths</code>.</td></tr>
 <tr><td><code>/api/all</code></td><td>bat + up + net + airtime, combined</td><td></td></tr>
 <tr><td><code>/api/env</code></td><td>temp, humidity, pressure, altitude, sensor, power: [[label, volts, amps], &hellip;], mcu_temp, chips: [[name, temp, humidity, pressure], &hellip;]</td><td>Env-sensor boards only (Solar Node P1). <code>power</code> only when a power monitor is fitted; a failed read gives <code>null</code>s. <code>chips</code> only with more than one sensor chip; <code>null</code> where a chip does not measure that, and left out if the reply would not fit in one packet. Errors if neither an environment sensor nor a power monitor is attached.</td></tr>
-<tr><td><code>/api/hist</code></td><td>total, o, last_s, cols: [h,pct,mv,chg,t,hum,hpa,mcu,nbrs,paths,boot], rows: [&hellip;]</td><td><code>SM_HISTORY</code> boards only (Solar Node P1, Heltec V3, Heltec V4). Hourly records, newest first; <code>h</code> = hours back. <code>?o=</code> skips that many hours, <code>?n=</code> sets how many rows (default 6, max 24). If the rows don't fit in one packet, fewer are sent and the reply ends with <code>"more":true</code>. Sensors that aren't fitted are <code>null</code>; <code>boot</code>=1 marks the first record after a restart.</td></tr>
+<tr><td><code>/api/hist</code></td><td>total, o, last_s, cols: [h,pct,mv,chg,t,hum,hpa,mcu,nbrs,paths,boot], rows: [&hellip;]</td><td><code>SM_HISTORY</code> boards only (Solar Node P1, Heltec V3, Heltec V4). Hourly records, newest first; <code>h</code> = hours back. <code>o</code> skips that many hours, <code>n</code> sets how many rows (same keys as <code>/api/paths</code>) (default 6, max 24). If the rows don't fit in one packet, fewer are sent and the reply ends with <code>"more":true</code>. Sensors that aren't fitted are <code>null</code>; <code>boot</code>=1 marks the first record after a restart.</td></tr>
 </tbody>
 </table>
 

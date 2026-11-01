@@ -46,6 +46,7 @@
 // ScotMesh: consulted by the LED helpers and the nRF52 Bluetooth start code
 bool sm_leds_off = false;
 bool sm_dfu_window = false;
+bool sm_txfail_boot = false;   // this boot follows a restart after a failed transmit (SM_TXFAIL_MAGIC)
 #include "Utilities.h"
 #include "DeviceUID.h"
 #include "Platform.h"
@@ -503,6 +504,7 @@ void setup() {
 
   #if MCU_VARIANT == MCU_NRF52 && defined(URTN_STATS_PAGES) && !defined(SCOTMESH_NO_PAGES)
     sm_dfu_window = (NRF_POWER->GPREGRET2 == SM_DFU_MAGIC);
+    sm_txfail_boot = (NRF_POWER->GPREGRET2 == SM_TXFAIL_MAGIC);
     NRF_POWER->GPREGRET2 = 0;
   #endif
 
@@ -1821,6 +1823,18 @@ void update_airtime() {
   #endif
 }
 
+// A transmit the radio never finished restarts the node. On ScotMesh nRF52
+// builds, leave a marker in GPREGRET2 first (it survives the reset), so the
+// next boot reports "tx-fail" instead of a plain soft reset: on Health,
+// /api/sys and in the LXMF restart alert, with a running count.
+static void tx_fail_reset() {
+  #if MCU_VARIANT == MCU_NRF52 && defined(SM_TXFAIL_MAGIC)
+    uint8_t sd = 0; sd_softdevice_is_enabled(&sd);
+    if (sd) { sd_power_gpregret_clr(1, 0xFF); sd_power_gpregret_set(1, SM_TXFAIL_MAGIC); } else NRF_POWER->GPREGRET2 = SM_TXFAIL_MAGIC;
+  #endif
+  hard_reset();
+}
+
 void transmit(uint16_t size) {
   if (radio_online) {
     if (!promisc) {
@@ -1843,7 +1857,7 @@ void transmit(uint16_t size) {
               if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
               else { LoRa->receive(); return; }
             #else
-              hard_reset();
+              tx_fail_reset();
             #endif
           }
 
@@ -1874,7 +1888,7 @@ void transmit(uint16_t size) {
           if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
           else { LoRa->receive(); return; }
         #else
-          hard_reset();
+          tx_fail_reset();
         #endif
       }
 

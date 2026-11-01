@@ -199,7 +199,7 @@
 <details>
 <summary><kbd>e</kbd> <code>/page/e.mu</code> &mdash; Health</summary>
 <ul>
-  <li>Free RAM / flash, uptime, boot count, last reset reason</li>
+  <li>Free RAM / flash, uptime, boot count, last reset reason, and on nRF52 boards how many restarts followed a failed transmit (reason "tx-fail")</li>
   <li>Radio noise floor, last RSSI/SNR, current + average airtime %</li>
   <li>Packets rx/tx, path/announce/known-destination/link/neighbour table sizes</li>
 </ul>
@@ -207,7 +207,7 @@
 
 <details>
 <summary><kbd>v</kbd> <code>/page/v.mu</code> &mdash; Visitors</summary>
-<p>Admin only. Who has a link open to the node right now, longest silent first (those are closed first by the link watchdog): short link id &middot; time since anything was received &middot; hops &middot; who. "who" is the visitor's announced name if they identified themselves, else their short identity hash, else "anon". 2+ hop links add "via" and the repeater they come through ("?" = guessed by signal). A dim letter marks links not yet active (p, h) or stale (s). 10 per page. Same data as <code>/api/links</code>.</p>
+<p>Admin only. Who has a link open to the node right now, as a table (dim header row: link &middot; idle &middot; hops &middot; who), longest idle first (those are closed first by the link watchdog): short link id &middot; idle = time since anything was received &middot; hops &middot; who. "who" is the visitor's announced name if they identified themselves, else their short identity hash, else "anon". 2+ hop links add "via" and the repeater they come through ("?" = guessed by signal). A dim letter marks links not yet active (p, h) or stale (s). 10 per page. Same data as <code>/api/links</code>.</p>
 </details>
 
 <details>
@@ -309,7 +309,7 @@
 <tr><td><code>/api/up</code></td><td>uptime, reset</td><td></td></tr>
 <tr><td><code>/api/net</code></td><td>routes, neighbours, rx, tx, links</td><td></td></tr>
 <tr><td><code>/api/radio</code></td><td>freq, bw, sf, cr, txp, airtime, noise, rssi, snr</td><td></td></tr>
-<tr><td><code>/api/sys</code></td><td>fw, board, name, free_ram, free_flash, free_pool, pool_fragmented, links_closed_stuck, links_closed_idle, links_closed_mem</td><td><code>free_pool</code>/<code>pool_fragmented</code>: the Reticulum memory pool, 0 on boards without one (Heltec V4). <code>links_closed_*</code>: links the watchdog closed since boot, as unfinished handshakes, after 725 s with nothing received, or to free memory.</td></tr>
+<tr><td><code>/api/sys</code></td><td>fw, board, name, free_ram, free_flash, free_pool, pool_fragmented, links_closed_stuck, links_closed_idle, links_closed_mem, tx_fail</td><td><code>free_pool</code>/<code>pool_fragmented</code>: the Reticulum memory pool, 0 on boards without one (Heltec V4). <code>links_closed_*</code>: links the watchdog closed since boot, as unfinished handshakes, after 725 s with nothing received, or to free memory. <code>tx_fail</code> (nRF52 boards): restarts after a failed transmit, kept across restarts.</td></tr>
 <tr><td><code>/api/health</code></td><td>free_ram, free_flash, reboots, reset, paths, paths_max, announces, neighbours</td><td></td></tr>
 <tr><td><code>/api/pos</code></td><td>lat, lon, height</td><td>Errors if the map page hasn't published a position.</td></tr>
 <tr><td><code>/api/paths</code></td><td>total, o, cols: [dest,hops,age_s,via], rows: [&hellip;]</td><td>Paginate with <code>o</code> (skip) and <code>n</code> (rows), short hashes with <code>s=1</code>. Not a <code>?</code> query string: send them as request-data keys, or in a NomadNet browser as link variables, e.g. <code>:/api/paths`s=1|n=10</code>. A path with <code>?</code> in it has no handler and times out.</td></tr>
