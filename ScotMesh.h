@@ -686,7 +686,11 @@ public:
     bool direct = nh == dest || RNS::Transport::hops_to(dest) <= 1;
     SmNbr n; n.id = nh; n.heard = RNS::Utilities::OS::time(); n.name[0] = 0;
     for (size_t i = 0; i < sm_nbrs.size(); i++) if (sm_nbrs[i].id == nh) { memcpy(n.name, sm_nbrs[i].name, sizeof n.name); sm_nbrs.erase(sm_nbrs.begin() + i); break; }
-    if (direct && !n.name[0] && app_data && app_data.size()) {
+    // Take the newest plain-text name, not only the first: after a restart the
+    // first one heard is often a cached announce from before a rename, and a
+    // first-wins name kept that stale label until the next restart. Names are
+    // per next hop, so a node announcing two text names would alternate.
+    if (direct && app_data && app_data.size()) {
       size_t l = app_data.size() < 16 ? app_data.size() : 16; bool ok = true;
       for (size_t k = 0; k < l; k++) { uint8_t c = app_data.data()[k]; if (c < 0x20 || c == '`') ok = false; }
       if (ok) { memcpy(n.name, app_data.data(), l); n.name[l] = 0; }
