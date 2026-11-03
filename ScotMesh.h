@@ -709,7 +709,10 @@ static void P_battery() {
   P("`F%s", p < 25 ? "f55" : p < 50 ? "da3" : "2c5");
   for (int i = 0; i < 10; i++) P(i < f ? "\xE2\x96\x88" : "\xE2\x96\x91");
   // ▲ charging, ● full (charged), ▼ on battery -- all from the Geometric Shapes block, so they render alike
-  P("`f %d%% %.2fV %s", p, battery_voltage, battery_state == BATTERY_STATE_CHARGED ? "`F2c5\xE2\x97\x8F`f" : sm_charging() ? "`F2c5\xE2\x96\xB2`f" : "`Fda3\xE2\x96\xBC`f");
+  // Full also when the shown (rounded) percentage is 100: CHARGED needs exactly 100.0,
+  // so 99.6 % showed "100% ... ▼".
+  bool full = battery_state == BATTERY_STATE_CHARGED || p >= 100;
+  P("`f %d%% %.2fV %s", p, battery_voltage, full ? "`F2c5\xE2\x97\x8F`f" : sm_charging() ? "`F2c5\xE2\x96\xB2`f" : "`Fda3\xE2\x96\xBC`f");
 }
 
 #ifdef SM_LXMF

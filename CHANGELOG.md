@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Home page battery: the green ● (full) also shows when the rounded percentage reads 100 %, instead of "100% … ▼" while the reading sat just under 100.0 %.
 - Neighbours page names follow renames: the cached neighbour name is now replaced by the name in the newest plain-text announce instead of keeping the first one heard. After a restart that first one was often a cached announce from before a rename, so a renamed node kept its old name until the next restart.
 - Solar Node P1: the SX1262 runs on its DC-DC regulator instead of the reset-default LDO (cherry-picked from Paul Meier's ScotMesh PR #6, commit 926378c). With the LDO the module's TCXO could fail to start under transmit load (XOSC_START_ERR after a TX); DC-DC is what RadioLib, Meshtastic and MeshCore use on this module, and by the datasheet it roughly halves the receive current of a repeater that listens all day.
 - nRF52 boards (Solar Node P1, RAK4631, ...): a restart after a failed transmit is no longer just another "soft-reset". The node leaves a marker in a register that survives the reset, so the next boot reports "tx-fail" as the reset reason on the Health page, in `/api/up` / `/api/health` and in the LXMF "running again" alert, and keeps a running count: "N tx-fail" on Health and `tx_fail` in `/api/sys` / `/api/health`. Wiped by a full reset.
