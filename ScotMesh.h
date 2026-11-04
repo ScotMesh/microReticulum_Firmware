@@ -675,12 +675,37 @@ static void sm_walk_paths(SmPathFn fn, void* ctx) {
 // announce, kept in a small RAM table from the announce handler, so pages
 // and the API never walk the (flash-backed) path table for them.
 // ---------------------------------------------------------------------------
+static RNS::Bytes sm_dest_of(const char* app, const char* aspect, const RNS::Bytes& id);   // below, with sm_last_hop
 struct SmNbr { RNS::Bytes id; double heard; char name[17]; };
 static std::vector<SmNbr> sm_nbrs;                    // max 16, newest first
 class SmAnnounceWatch : public RNS::AnnounceHandler {
 public:
   SmAnnounceWatch() : RNS::AnnounceHandler(nullptr) {}
   void received_announce(const RNS::Bytes& dest, const RNS::Identity& id, const RNS::Bytes& app_data) override {
+    // The library stores a destination's app_data (its announced name) only on
+    // the first announce, to spare the flash, and hands handlers that stored
+    // copy, not the new announce's -- so a rename never reached the Visitors
+    // names, /api/links or Neighbours, not even after a restart. For LXMF and
+    // NomadNet addresses (the names we show) read the app_data from the
+    // announce packet itself (the path table holds the one just validated) and
+    // store it again when it changed: names change rarely, so the flash still
+    // is not written per announce. The entry's packet hash is unused.
+    RNS::Bytes ad = app_data;
+    if (id && ad && ad.size()) {
+      RNS::Bytes ih = id.hash();
+      if (dest == sm_dest_of("lxmf", "delivery", ih) || dest == sm_dest_of("nomadnetwork", "node", ih)) {
+        RNS::Packet p = RNS::Transport::find_announce_packet_from_hash(dest);
+        if (p) {
+          using namespace RNS::Type::Identity;
+          size_t off = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8
+                     + (p.context_flag() == RNS::Type::Packet::FLAG_SET ? RATCHETSIZE/8 : 0);
+          if (p.data().size() > off) {
+            RNS::Bytes fresh = p.data().mid(off);
+            if (!(fresh == ad)) { RNS::Identity::remember(dest, dest, id.get_public_key(), fresh); ad = fresh; }
+          }
+        }
+      }
+    }
     RNS::Bytes nh = RNS::Transport::next_hop(dest);
     if (!nh || nh.size() != 16) return;
     bool direct = nh == dest || RNS::Transport::hops_to(dest) <= 1;
@@ -690,10 +715,10 @@ public:
     // first one heard is often a cached announce from before a rename, and a
     // first-wins name kept that stale label until the next restart. Names are
     // per next hop, so a node announcing two text names would alternate.
-    if (direct && app_data && app_data.size()) {
-      size_t l = app_data.size() < 16 ? app_data.size() : 16; bool ok = true;
-      for (size_t k = 0; k < l; k++) { uint8_t c = app_data.data()[k]; if (c < 0x20 || c == '`') ok = false; }
-      if (ok) { memcpy(n.name, app_data.data(), l); n.name[l] = 0; }
+    if (direct && ad && ad.size()) {
+      size_t l = ad.size() < 16 ? ad.size() : 16; bool ok = true;
+      for (size_t k = 0; k < l; k++) { uint8_t c = ad.data()[k]; if (c < 0x20 || c == '`') ok = false; }
+      if (ok) { memcpy(n.name, ad.data(), l); n.name[l] = 0; }
     }
     sm_nbrs.insert(sm_nbrs.begin(), n); if (sm_nbrs.size() > 16) sm_nbrs.pop_back();
   }
