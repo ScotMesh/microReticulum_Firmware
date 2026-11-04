@@ -1286,7 +1286,8 @@ static void pg_access() {
 static void pg_device() {
   Ph("Device"); P_item("Health", 'e');
   PL("Routes", 'r'); P("  "); PL("Neighbours", 'b'); P("  "); PL("Visitors", 'v'); P("\n"); P_item("Lights & Bluetooth", 'i', sm.leds == 0 ? "lights on" : sm.leds == 1 ? "lights off" : "lights 10 min");
-  P_item("Logs", 'o'); P_item("Maintenance", 'x'); P_item("Restart & update", 'm'); P_item("About", 'u'); P("\n"); PBACK();
+  P_item("Logs", 'o'); PL("Maintenance", 'x'); P("  "); PL("Announce now", 'x', "a=an"); P("\n");   // the Maintenance action, one tap closer
+  P_item("Restart & update", 'm'); P_item("About", 'u'); P("\n"); PBACK();
 }
 
 static void pg_name(const RNS::Bytes& rid) {
