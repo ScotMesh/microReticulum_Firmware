@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Admin page no longer turns into "Page too large": reached over several hops while a warning showed (radio trial waiting for confirm, password registrations waiting), especially with a long node name, it outgrew one packet and hid the very confirm link it was opened for. It now leaves out the "Last hop" line first (the Visitors page shows it as "via"), then shortens the verified identity to 8 characters, until it fits. Nothing changes when it already fits.
 - Visitors page, `/api/links` and Neighbours names follow renames: a visitor who changed their name (e.g. in MeshChatX) kept showing the old one, even after a restart. The Reticulum library stores a destination's announced name only from its first announce, in flash, to spare it from a write per announce, and passes that stored copy (not the new announce's) to the node's announce handling. For LXMF and NomadNet addresses the node now reads the name from the announce packet itself and stores it again when it changed. Names change rarely, so the flash is still not written per announce.
 - Home page battery: the green ● (full) also shows when the rounded percentage reads 100 %, instead of "100% … ▼" while the reading sat just under 100.0 %.
 - Neighbours page names follow renames: the cached neighbour name is now replaced by the name in the newest plain-text announce instead of keeping the first one heard. After a restart that first one was often a cached announce from before a rename, so a renamed node kept its old name until the next restart.

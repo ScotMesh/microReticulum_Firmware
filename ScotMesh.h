@@ -1244,28 +1244,39 @@ static void pg_visitors() {
   P("\n"); PL("Routes", 'r'); P("  "); PL("Neighbours", 'b'); P("  "); PL("Device", 'd'); P("  "); PL("Home", 'I');
 }
 
+// Over several hops with a warning showing (radio trial, waiting
+// registrations) and a long name this page outgrew one packet, and "Page too
+// large" hid the very confirm link it was opened for. Rebuilt until it fits:
+// first without the "Last hop" line (Visitors shows it as "via"), then with
+// the identity shortened to 8 characters, as on the admin home view.
 static void pg_hub(const RNS::Bytes& rid, const RNS::Bytes& link_id) {
-  Ph(nomadnet_name); P("%d%% " MIDDOT " up %s\n", sm_pct(), sm_up());
-  if (const SmLinkSeen* l = sm_link_find(link_id)) {   // the admin home view usually runs over budget and drops it
-    P_link(l, true);
-    if (l->hops > 1) {
-      bool guessed; RNS::Bytes t = sm_last_hop(rid, l->rssi, l->rssi != 0, guessed);
-      P(DIM("Last hop") " ");
-      if (!t) P(DIM("unknown") "\n");
-      else { P_relay_name(t); P(guessed ? "? " DIM("by signal") "\n" : " " DIM("from path table") "\n"); }
+  const SmLinkSeen* l = sm_link_find(link_id);   // the admin home view usually runs over budget and drops it
+  bool guessed = false; RNS::Bytes t;
+  if (l && l->hops > 1) t = sm_last_hop(rid, l->rssi, l->rssi != 0, guessed);   // once: it may read the path table
+  for (int pass = 0; pass < 3; pass++) {
+    pb_reset();
+    Ph(nomadnet_name); P("%d%% " MIDDOT " up %s\n", sm_pct(), sm_up());
+    if (l) {
+      P_link(l, true);
+      if (l->hops > 1 && pass == 0) {
+        P(DIM("Last hop") " ");
+        if (!t) P(DIM("unknown") "\n");
+        else { P_relay_name(t); P(guessed ? "? " DIM("by signal") "\n" : " " DIM("from path table") "\n"); }
+      }
     }
-  }
-  P_verified(rid);
-  if (sm_trial) { P("`Fda3! Radio trial`f "); PL("confirm", 'f'); P("\n"); }
-  if (!sm_pending.empty()) { char l[16]; snprintf(l, sizeof l, "%u waiting", (unsigned)sm_pending.size()); P("`Fda3!`f "); PL(l, 'q'); P("\n"); }
-  P("\n>>Admin\n"); PL("Settings", 's'); P("  "); PL("Access", 'c'); P("  "); PL("Device", 'd');
+    P_verified(rid, pass == 2);
+    if (sm_trial) { P("`Fda3! Radio trial`f "); PL("confirm", 'f'); P("\n"); }
+    if (!sm_pending.empty()) { char w[16]; snprintf(w, sizeof w, "%u waiting", (unsigned)sm_pending.size()); P("`Fda3!`f "); PL(w, 'q'); P("\n"); }
+    P("\n>>Admin\n"); PL("Settings", 's'); P("  "); PL("Access", 'c'); P("  "); PL("Device", 'd');
 #ifdef HAS_ENV_SENSORS
-  P("  "); PL("Telemetry", 't');
+    P("  "); PL("Telemetry", 't');
 #endif
 #ifdef SM_HISTORY
-  P("  "); PL("History", 'z');
+    P("  "); PL("History", 'z');
 #endif
-  P("\n<\n"); PL("Home", 'I');
+    P("\n<\n"); PL("Home", 'I');
+    if (sm_pn <= SM_HARD_LIMIT) break;
+  }
 }
 static const char* SM_ROLE_NAME[] = {"Fixed relay", "Access point", "Mobile", "End device"};
 static int sm_role() {
