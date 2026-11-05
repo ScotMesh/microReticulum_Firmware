@@ -4,6 +4,7 @@
 
 ### Added
 
+- Solar Node P1: the undocumented SX1262 receive-sensitivity patch (bit 0 of register 0x08B5) recommended by Heltec/Semtech, as Meshtastic runs it on the P1 together with boosted gain. A build flag (`SX126X_RX_PATCH`), on for the P1 only; MeshCore enables it only on boards with an RF front end.
 - Grove-port sensor support on the Solar Node P1: SHT4x, SHTC3, AHT10/20, BME280, BME680, BMP180, M5 ENV I/II/III, and INA219/INA226/INA260/INA3221 power monitors, plus the nRF52840's own die temperature — all on the Telemetry page and `/api/env`.
 - 7-day telemetry history (battery, sensors, mesh) with a History page and `/api/hist` endpoint.
 - LXMF alerts to admins (restart recovery, low battery) and a `status` command, from the node's own announced LXMF address.
@@ -23,6 +24,7 @@
 
 ### Fixed
 
+- SX1262 boards (Solar Node P1, Heltec V3/V4, RAK4631, ...): the radio can no longer go deaf on a missed receive interrupt. A received packet is signalled by a rising edge on the radio's DIO pin; if that edge was missed, the packet flag stayed set, the pin stayed high and no new edge came, so nothing more was received until a restart. Once a second the node now checks for a pin that is high with nothing pending and handles it as the missed packet (as Meshtastic does). The Health page shows "N missed" next to the packet counts if it ever happened.
 - Admin page no longer turns into "Page too large": reached over several hops while a warning showed (radio trial waiting for confirm, password registrations waiting), especially with a long node name, it outgrew one packet and hid the very confirm link it was opened for. It now leaves out the "Last hop" line first (the Visitors page shows it as "via"), then shortens the verified identity to 8 characters, until it fits. Nothing changes when it already fits.
 - Visitors page, `/api/links` and Neighbours names follow renames: a visitor who changed their name (e.g. in MeshChatX) kept showing the old one, even after a restart. The Reticulum library stores a destination's announced name only from its first announce, in flash, to spare it from a write per announce, and passes that stored copy (not the new announce's) to the node's announce handling. For LXMF and NomadNet addresses the node now reads the name from the announce packet itself and stores it again when it changed. Names change rarely, so the flash is still not written per announce.
 - Home page battery: the green ● (full) also shows when the rounded percentage reads 100 %, instead of "100% … ▼" while the reading sat just under 100.0 %.

@@ -1462,7 +1462,11 @@ static void pg_health() {
   P("\n");
   P(DIM("Radio") " noise %d, last %d/%ddB\n", noise_floor, last_rssi, (int)((int8_t)last_snr_raw) / 4);
   P(DIM("Air") " %.1f%% now, %.1f%% avg\n", airtime * 100, longterm_airtime * 100);
-  P(DIM("Pkts") " rx %lu, tx %lu\n", (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0));
+  P(DIM("Pkts") " rx %lu, tx %lu", (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0));
+#if MODEM == SX1262
+  if (sx126x_modem._missed_rx) P(", %lu missed", (unsigned long)sx126x_modem._missed_rx);   // received packets the radio's interrupt didn't report (should stay 0)
+#endif
+  P("\n");
   P(DIM("Tables") " paths %u/%u, ann %u\nknown %u, links %u, nbrs %u\n", (unsigned)RNS::Transport::new_path_table().size(), (unsigned)RNS::Transport::path_table_maxsize(),
     (unsigned)RNS::Transport::announce_table().size(), (unsigned)RNS::Identity::known_destinations().size(), (unsigned)RNS::Transport::active_links().size(), (unsigned)sm_nbrs.size());
   P(DIM("Closed") " stuck %lu, idle %lu, mem %lu\n", (unsigned long)sm_links_closed_stuck, (unsigned long)sm_links_closed_idle, (unsigned long)sm_links_closed_mem);

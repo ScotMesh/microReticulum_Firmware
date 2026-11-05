@@ -148,6 +148,10 @@ private:
   uint8_t _packet[255];
   bool _preinit_done;
   volatile bool _dio0_pending;
+  uint32_t _dio0_polled = 0;     // last missed-RX poll (handleDio0IfPending)
+public:
+  uint32_t _missed_rx = 0;       // packets picked up by that poll: should stay 0
+private:
   void (*_onReceive)(int);
 
   // Runtime override state. _tcxoVoltageOverride defaults to 0xFF (= "no

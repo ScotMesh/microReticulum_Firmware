@@ -65,6 +65,7 @@
 #define OP_FIFO_READ_6X             0x1E
 #define REG_OCP_6X                0x08E7
 #define REG_LNA_6X                0x08AC // No agc in sx1262
+#define REG_RX_PATCH_6X           0x08B5 // undocumented, see begin()
 #define REG_SYNC_WORD_MSB_6X      0x0740
 #define REG_SYNC_WORD_LSB_6X      0x0741
 #define REG_PAYLOAD_LENGTH_6X     0x0702 // https://github.com/beegee-tokyo/SX126x-Arduino/blob/master/src/radio/sx126x/sx126x.h#L98
@@ -486,6 +487,15 @@ int sx126x::begin(uint32_t frequency) {
   setTxPower(2);
   enableCrc();
   writeRegister(REG_LNA_6X, 0x96); // Set LNA boost
+  #ifdef SX126X_RX_PATCH
+    // Undocumented RX sensitivity patch: bit 0 of 0x08B5, recommended by
+    // Heltec/Semtech for boards with a GC1109 front end; Meshtastic sets it on
+    // every SX126x (the Solar Node P1 included, with boosted gain), MeshCore
+    // only per board (SX126X_REGISTER_PATCH, not on its P1 build). Opt-in per
+    // env; on for the P1. An A/B on the roof P1 showed no change in the
+    // measured noise floor. Set after calibrate(), which may reset it.
+    writeRegister(REG_RX_PATCH_6X, readRegister(REG_RX_PATCH_6X) | 0x01);
+  #endif
   uint8_t basebuf[2] = {0}; // Set base addresses
   executeOpcode(OP_BUFFER_BASE_ADDR_6X, basebuf, 2);
 
@@ -1026,6 +1036,15 @@ void sx126x::dumpRegisters(Stream& out) {
 }
 
 void sx126x::handleDio0IfPending() {
+  // A received packet is signalled by a RISING edge on DIO. If that edge is
+  // missed, RX_DONE stays set, DIO stays high and no new edge ever comes: the
+  // radio is deaf until a restart. Once a second, a DIO that is high with
+  // nothing pending is handled as the missed packet (Meshtastic's
+  // pollMissedIrqs). DIO only carries RX_DONE, so high means a packet waits.
+  if (!_dio0_pending && _onReceive && _dio0 != -1 && millis() - _dio0_polled >= 1000) {
+    _dio0_polled = millis();
+    if (digitalRead(_dio0) == HIGH) { _dio0_pending = true; _missed_rx++; }
+  }
   if (_dio0_pending) {
     _dio0_pending = false;
     handleDio0Rise();
