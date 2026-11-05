@@ -23,6 +23,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <cmath>
+#include <algorithm>
 
 #include <SHA256.h>
 #include <microReticulum/Transport.h>
@@ -42,6 +43,9 @@
 #endif
 #ifdef HAS_PROVISIONING
 #include <microReticulum/Provisioning/Provisioning.h>
+#endif
+#ifdef HAS_ENV_SENSORS
+#include "EnvSensors.h"
 #endif
 
 #ifndef SCOTMESH_FW_TAG
@@ -94,10 +98,43 @@
   #endif
 #endif
 
+// Optional pages / API endpoints, spliced into the registration tables and the /api index
+#ifdef HAS_ENV_SENSORS
+  #define SM_IDS_ENV "t"
+  #define SM_API_ENV , "/api/env"
+  #define SM_API_ENV_NAME ",\"env\""
+#else
+  #define SM_IDS_ENV ""
+  #define SM_API_ENV
+  #define SM_API_ENV_NAME ""
+#endif
+#ifdef SM_HISTORY                       // telemetry history, needs room on flash (P1: QSPI)
+  #define SM_IDS_HIST "z"
+  #define SM_API_HIST , "/api/hist"
+  #define SM_API_HIST_NAME ",\"hist\""
+#else
+  #define SM_IDS_HIST ""
+  #define SM_API_HIST
+  #define SM_API_HIST_NAME ""
+#endif
+
+#define SM_UPDATE_IP     "10.73.73.1"   // WiFi update window address (sm_update_mode)
 #define SM_HOME_BUDGET   400
 #define SM_HARD_LIMIT    409      // 431 B link MDU minus response framing
 #define SM_RAM_FLOOR     8192     // below this, answer "busy" instead of building
+// Below this many free bytes in the TLSF link pool (not the general heap --
+// see J_ram()/free_pool), sm_links_watchdog() starts closing links to make
+// room -- unfinished handshakes first, then the least recently heard -- even
+// ones not idle long enough for the normal timeout. nRF52 pool builds only. Override
+// per-board/environment with a build flag (platformio.ini: build_flags =
+// -DSM_MIN_POOL_FREE=15360) rather than editing this -- boards that don't
+// set one keep this default.
+#ifndef SM_MIN_POOL_FREE
+#define SM_MIN_POOL_FREE (10*1024)
+#endif
+static uint32_t sm_links_closed_stuck = 0, sm_links_closed_idle = 0, sm_links_closed_mem = 0;   // sm_links_watchdog(), shown on Health and /api/sys
 #define SM_DFU_MAGIC     0x5D     // GPREGRET2 value asking the next boot for a BLE update window
+#define SM_TXFAIL_MAGIC  0x7F     // GPREGRET2 value: restarted after a failed transmit (tx_fail_reset)
 #define SM_DFU_WINDOW_MS (20UL * 60UL * 1000UL)
 #define SM_TRIAL_MS      (5UL * 60UL * 1000UL)
 // Forgetting paired phones needs bond storage: nRF52 (Bluefruit) and ESP32 BLE; not ESP32 classic Bluetooth
@@ -116,11 +153,12 @@ extern RNS::Interface lora_interface;
 // ---------------------------------------------------------------------------
 // Persisted settings (own small file; provisioning keeps name/role/admins)
 // ---------------------------------------------------------------------------
-enum : uint8_t { SMH_BAT = 1, SMH_UP = 2, SMH_RADIO = 4, SMH_PATHS = 8, SMH_AIR = 16, SMH_OP = 32, SMH_ROUTES = 64 };
+enum : uint8_t { SMH_BAT = 1, SMH_UP = 2, SMH_RADIO = 4, SMH_PATHS = 8, SMH_AIR = 16, SMH_OP = 32, SMH_ROUTES = 64, SMH_NOLINK = 128 };   // NOLINK is inverted: set hides the line, so existing configs show it
+enum : uint8_t { SMH2_NOCREDIT = 1, SMH2_NOVER = 2 };   // home2, all inverted the same way: set hides the footer line
 struct SmConfig {
   uint32_t magic = 0x31434D53;           // "SMC1"
   uint8_t  home = SMH_BAT | SMH_UP | SMH_PATHS | SMH_OP | SMH_ROUTES;
-  uint8_t  api = 1;
+  uint8_t  api = 1;                      // unused: the JSON API is always on (kept so stored configs load)
   uint8_t  leds = 0;                     // 0 on, 1 off, 2 first 10 min after start
   uint8_t  pw_on = 0, pw_approval = 0, pw_set = 0;
   uint8_t  pw_salt[16] = {0};
@@ -137,12 +175,45 @@ struct SmConfig {
   uint8_t  ann = 3;                      // announce every: 0 30 min, 1 1 h, 2 3 h, 3 6 h, 4 12 h
   uint8_t  upd_wifi = 0;                 // ESP32: next boot opens the WiFi update window instead of the mesh
   char     upd_pw[9] = "";               // its one-time WiFi password
-  uint8_t  reserved[5] = {0};
+  uint8_t  wall[4] = {0};               // last known wall clock, for LXMF message times (SM_LXMF)
+  uint8_t  home2 = 0;                    // SMH2_*: footer lines hidden from visitors (was reserved[1], same size)
 };
 static SmConfig sm;
 static const char* SM_CFG_PATH = "/scotmesh.cfg";
 static const char* SM_LOG_PATH = "/scotmesh.chg";
+static const char* SM_HIST_PATH = "/scotmesh.hst";   // telemetry history (SM_HISTORY)
+static const char* SM_LOC_PATH = "/scotmesh.loc";    // local footer line (own file: SmConfig has no room left)
 static void sm_save() { RNS::Utilities::OS::write_file(SM_CFG_PATH, RNS::Bytes((const uint8_t*)&sm, sizeof(sm))); }
+// Optional local line above the ScotMesh credit on the home page: a country
+// flag (from a 2-letter code) and a short text, both set on the Name page.
+struct SmLocal { char cc[3]; char text[25]; };
+static SmLocal sm_loc{};
+static void sm_loc_save() { RNS::Utilities::OS::write_file(SM_LOC_PATH, RNS::Bytes((const uint8_t*)&sm_loc, sizeof(sm_loc))); }
+// Battery calibration (Power page): meter reading / node reading, applied to
+// every ADC battery sample (battery_cal, Power.h). Own file -- SmConfig has no
+// room left -- and kept on a full reset: it belongs to the hardware, not the
+// settings. No file = 1.0 = the board's built-in scale.
+#if HAS_PMU == true && BAT_ADC_BOARD
+  #define SM_BAT_CAL 1
+  static const char* SM_CAL_PATH = "/scotmesh.cal";
+  static void sm_cal_load() {
+    RNS::Bytes b; float c;
+    if (!RNS::Utilities::OS::file_exists(SM_CAL_PATH) || RNS::Utilities::OS::read_file(SM_CAL_PATH, b) != sizeof(c)) return;
+    memcpy(&c, b.data(), sizeof(c)); if (c >= 0.9f && c <= 1.1f) battery_set_cal(c);
+  }
+#endif
+static void sm_loc_load() {
+  RNS::Bytes b;
+  if (RNS::Utilities::OS::file_exists(SM_LOC_PATH) && RNS::Utilities::OS::read_file(SM_LOC_PATH, b) == sizeof(sm_loc)) {
+    memcpy(&sm_loc, b.data(), sizeof(sm_loc)); sm_loc.cc[2] = 0; sm_loc.text[sizeof(sm_loc.text) - 1] = 0;
+  }
+}
+// "NL" -> the flag emoji: two regional indicator symbols (U+1F1E6 + letter), 8 bytes UTF-8
+static const char* sm_flag_of(const char* cc, char* out) {   // out: 9 bytes
+  if (strlen(cc) != 2 || cc[0] < 'A' || cc[0] > 'Z' || cc[1] < 'A' || cc[1] > 'Z') { out[0] = 0; return out; }
+  for (int i = 0; i < 2; i++) { out[i * 4] = '\xF0'; out[i * 4 + 1] = '\x9F'; out[i * 4 + 2] = '\x87'; out[i * 4 + 3] = (char)(0xA6 + cc[i] - 'A'); }
+  out[8] = 0; return out;
+}
 static void sm_load() {
   RNS::Bytes b;
   if (RNS::Utilities::OS::file_exists(SM_CFG_PATH) && RNS::Utilities::OS::read_file(SM_CFG_PATH, b) == sizeof(sm)) {
@@ -154,6 +225,11 @@ static void sm_load() {
 // Runtime state (RAM, all capped)
 // ---------------------------------------------------------------------------
 static const char* sm_reset_reason = "power-on";
+#if MCU_VARIANT == MCU_NRF52
+  // Restarts after a failed transmit, kept across restarts in its own file.
+  static const char* SM_TXF_PATH = "/scotmesh.txf";
+  static uint32_t sm_txfails = 0;
+#endif
 static uint64_t sm_up_ms = 0; static uint32_t sm_last_millis = 0;
 static uint32_t sm_blink_until = 0, sm_dfu_action = 0, sm_dfu_action_at = 0;
 struct SmRadio { uint32_t f, bw; int sf, cr, txp; };
@@ -168,6 +244,16 @@ struct SmFail { RNS::Bytes id; uint8_t n; uint32_t lock_until; };
 static std::vector<SmFail> sm_fails;                 // max 8
 static uint32_t sm_global_fails[10] = {0}; static uint8_t sm_gf_next = 0; static uint32_t sm_reg_paused_until = 0;
 static char sm_last_attempt[16] = "";
+// Hop count and signal of the last packet heard on each link, for the visitor's
+// "Your link" line on the home page. Read straight from the raw header in the
+// receive-packet hook (sm_link_seen), so the library needs no change.
+struct SmLinkSeen { uint8_t id[16]; uint8_t hops; bool sig; int16_t rssi; float snr; uint32_t at; };
+static SmLinkSeen sm_ls[8] = {};
+// Repeaters heard directly, with their signal: a rebroadcast announce (HEADER_2)
+// carries the transport id of the node that just sent it. Used to guess a
+// link's last hop by signal when the path table can't tell (Admin page).
+struct SmRelay { uint8_t id[16]; int16_t rssi; uint32_t at; };
+static SmRelay sm_relays[8] = {};
 static const uint16_t SM_ANN_MIN[] = {30, 60, 180, 360, 720};
 static uint32_t sm_ann_ms() { return (uint32_t)SM_ANN_MIN[sm.ann > 4 ? 3 : sm.ann] * 60000UL; }
 
@@ -194,6 +280,35 @@ void sm_log_line(const char* msg) {
   strncpy(sm_log_ring[sm_log_next], msg, sizeof(sm_log_ring[0]) - 1); sm_log_ring[sm_log_next][sizeof(sm_log_ring[0]) - 1] = 0;
   for (char* p = sm_log_ring[sm_log_next]; *p; p++) if (*p == '`' || *p == '\n' || *p == '\r') *p = ' ';
   sm_log_next = (sm_log_next + 1) % 5; if (sm_log_count < 5) sm_log_count++;
+}
+
+// Every inbound packet (fed from on_receive_packet, before Transport handles it).
+// Only link packets count: their destination hash is the link id. raw[1] is the
+// hop count as sent; Transport adds 1 on arrival, so a direct packet is 1 hop.
+void sm_link_seen(const RNS::Bytes& raw, const RNS::Interface& iface) {
+  const uint8_t* r = raw.data(); size_t n = raw.size();
+  if (n < 19 || (r[0] & 0x80)) return;                                                           // 0x80: IFAC-masked header
+  if ((r[0] & 0x40) && (r[0] & 3) == RNS::Type::Packet::ANNOUNCE && n >= 35) {                  // rebroadcast announce: r+2 is its sender
+    float rssi = iface ? iface.r_stat_rssi() : NAN; if (isnan(rssi) || rssi >= 0) return;   // >= 0: the SX126x status read came back empty
+    SmRelay* e = &sm_relays[0];
+    for (auto& s : sm_relays) { if (!memcmp(s.id, r + 2, 16)) { e = &s; break; } if (s.at < e->at) e = &s; }
+    memcpy(e->id, r + 2, 16); e->rssi = (int16_t)rssi; e->at = millis() | 1;
+    return;
+  }
+  if (((r[0] >> 2) & 3) != RNS::Type::Destination::LINK) return;
+  size_t off = (r[0] & 0x40) ? 18 : 2;                                                           // HEADER_2 carries a transport id first
+  if (n < off + 17) return;
+  SmLinkSeen* e = &sm_ls[0];
+  for (auto& s : sm_ls) { if (!memcmp(s.id, r + off, 16)) { e = &s; break; } if (s.at < e->at) e = &s; }
+  memcpy(e->id, r + off, 16); e->hops = r[1] < 255 ? r[1] + 1 : 255; e->at = millis() | 1;
+  float rssi = iface ? iface.r_stat_rssi() : NAN, snr = iface ? iface.r_stat_snr() : NAN;
+  e->sig = !isnan(snr); e->snr = e->sig ? snr : 0;
+  e->rssi = !isnan(rssi) && rssi < 0 ? (int16_t)rssi : 0;   // 0 = no reading: the SX126x status read can come back empty (-0/2 dBm)
+}
+static const SmLinkSeen* sm_link_find(const RNS::Bytes& link_id) {
+  if (link_id.size() != 16) return nullptr;
+  for (auto& s : sm_ls) if (s.at && !memcmp(s.id, link_id.data(), 16)) return &s;
+  return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +350,9 @@ static void PLf(const char* label, char pg, const char* fmt, ...) { char f[64]; 
 static void PC(const char* name, bool on) { P("`<?|%s|1%s`>", name, on ? "|*" : ""); }
 static void PR(const char* name, const char* v, bool on) { P("`<^|%s|%s%s`>", name, v, on ? "|*" : ""); }
 static void PF(int w, const char* name, const char* val) { P("`<%d|%s`%s>", w, name, val); }
-static void PBACK() { P("`[< Admin`:/page/a.mu]"); }
+// Back to the page one level up: the Admin hub, or the Settings / Access /
+// Device menu a sub page was opened from.
+static void PBACK(char up = 'a') { P("`[< %s`:/page/%c.mu]", up == 's' ? "Settings" : up == 'c' ? "Access" : up == 'd' ? "Device" : "Admin", up); }
 
 // ---------------------------------------------------------------------------
 // Request data: msgpack map. NomadNet sends field_* / var_*, API clients raw keys.
@@ -280,6 +397,10 @@ static const char* Q(const char* key) { for (uint8_t i = 0; i < sm_nkv; i++) if 
 static bool Qhas(const char* key) { for (uint8_t i = 0; i < sm_nkv; i++) if (!strcmp(sm_kv[i].k, key)) return true; return false; }
 static const char* Fv(const char* n) { char k[16]; snprintf(k, sizeof k, "field_%s", n); return Q(k); }
 static const char* Vv(const char* n) { char k[16]; snprintf(k, sizeof k, "var_%s", n); return Q(k); }
+// API paging keys: raw request-data keys (scripts) or NomadNet link variables
+// (`/api/links`s=1|n=4` in a browser arrives as var_s, var_n).
+static const char* Qa(const char* k) { return Qhas(k) ? Q(k) : Vv(k); }
+static bool Qahas(const char* k) { char v[16]; snprintf(v, sizeof v, "var_%s", k); return Qhas(k) || Qhas(v); }
 static bool Fis(const char* n, const char* v) { return !strcmp(Fv(n), v); }
 static bool Vis(const char* n, const char* v) { return !strcmp(Vv(n), v); }
 
@@ -360,7 +481,7 @@ void sm_early_boot() {
   if (RNS::Utilities::OS::file_exists(SM_WIPE_PATH)) {
     printf("[scotmesh] full reset: wiping identity, routes, known identities and settings\n");
     for (const char* d : {"./path_store", "./known_store", "./hashlist_store", "./cache"}) sm_wipe_dir(d);
-    for (const char* f : {"./transport_identity", "./destination_table", "./tunnels", SM_CFG_PATH, SM_LOG_PATH, SM_WIPE_PATH}) if (RNS::Utilities::OS::file_exists(f)) RNS::Utilities::OS::remove_file(f);
+    for (const char* f : {"./transport_identity", "./destination_table", "./tunnels", SM_CFG_PATH, SM_LOG_PATH, SM_HIST_PATH, SM_LOC_PATH, "/scotmesh.key", "/scotmesh.txf", SM_WIPE_PATH}) if (RNS::Utilities::OS::file_exists(f)) RNS::Utilities::OS::remove_file(f);
   }
 #if defined(SCOTMESH_WIFI_UPDATE)
   sm_update_mode();
@@ -374,19 +495,32 @@ void sm_update_mode() {
   if (!sm.upd_wifi) return;
   char pw[9]; memcpy(pw, sm.upd_pw, 9); pw[8] = 0;
   sm.upd_wifi = 0; memset(sm.upd_pw, 0, sizeof sm.upd_pw); sm_save();       // one boot only, even if this one crashes
-  printf("[update] WiFi update window: SSID ScotMesh-Update, 20 min\n");
-  WiFi.mode(WIFI_AP); WiFi.softAP("ScotMesh-Update", pw); delay(200);
+  printf("[update] WiFi update window: SSID ScotMesh-Update, http://" SM_UPDATE_IP ", 20 min\n");
+  // 10.73.73.1 rather than the ESP32 default 192.168.4.1, which home networks
+  // often use too (a laptop on both cannot reach the node). 73: "best regards".
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(10, 73, 73, 1), IPAddress(10, 73, 73, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("ScotMesh-Update", pw); delay(200);
   static WebServer srv(80); static bool done = false, failed = false; static size_t got = 0;
   static const char* page =
-    "<!doctype html><meta name=viewport content='width=device-width'><title>ScotMesh node update</title>"
+    "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>ScotMesh node update</title>"
     "<body style='font:16px system-ui;max-width:32em;margin:2em auto;padding:0 1em'><h2>" BOARD_SHORT_NAME " \xc2\xb7 " SCOTMESH_FW_TAG "</h2>"
     "<p>Choose the <b>.bin</b> from inside the release zip (rnode_firmware_&hellip;.bin) and press Update. Keep this page open; the node restarts by itself when done.</p>"
-    "<form method=POST action=/update enctype=multipart/form-data><input type=file name=fw accept=.bin required> <button>Update</button></form>"
-    "<p style='color:#666'>This window closes 20 minutes after it opened.</p>";
-  srv.on("/", HTTP_GET, []() { srv.send(200, "text/html", page); });
+    "<form id=f method=POST action=/update enctype=multipart/form-data><input type=file name=fw accept=.bin required> <button id=b>Update</button></form>"
+    "<p><progress id=p max=100 value=0 style='width:100%' hidden></progress><br><span id=t></span></p>"
+    "<p style='color:#666'>This window closes 20 minutes after it opened.</p>"
+    // Progress from the browser's own upload counter; without JS the plain form still works.
+    "<script>f.onsubmit=function(e){e.preventDefault();var x=new XMLHttpRequest();x.open('POST','/update');"
+    "x.upload.onprogress=function(e){if(e.lengthComputable){var c=Math.round(e.loaded*100/e.total);p.value=c;"
+    "t.textContent=c+'%  ('+(e.loaded/1048576).toFixed(2)+' of '+(e.total/1048576).toFixed(2)+' MB)';}};"
+    "x.upload.onload=function(){t.textContent='Upload complete, the node is verifying the image...';};"
+    "x.onload=function(){if(x.status==200)document.body.innerHTML=x.responseText;else t.textContent=x.responseText;};"
+    "x.onerror=function(){t.textContent='Connection lost. If your computer left the ScotMesh-Update WiFi, rejoin it and reload this page.';b.disabled=false;};"
+    "x.send(new FormData(f));b.disabled=true;p.hidden=false;t.textContent='Starting upload...';};</script>";
+  srv.on("/", HTTP_GET, []() { srv.send(200, "text/html; charset=utf-8", page); });
   srv.on("/update", HTTP_POST, []() {
     if (failed) { srv.send(500, "text/plain", "Update failed: " + String(Update.errorString()) + ". The node restarts unchanged; open a new window from its page to try again."); delay(1500); hard_reset(); }
-    srv.send(200, "text/html", "<!doctype html><body style='font:16px system-ui;margin:2em'><h2>Updated.</h2><p>Written and verified; the node is restarting into the new firmware now. You can reconnect your phone to its usual WiFi.</p>");
+    srv.send(200, "text/html; charset=utf-8", "<!doctype html><body style='font:16px system-ui;margin:2em'><h2>Updated.</h2><p>Written and verified; the node is restarting into the new firmware now. You can reconnect your phone to its usual WiFi.</p>");
     done = true;
   }, []() {
     HTTPUpload& up = srv.upload();
@@ -541,21 +675,50 @@ static void sm_walk_paths(SmPathFn fn, void* ctx) {
 // announce, kept in a small RAM table from the announce handler, so pages
 // and the API never walk the (flash-backed) path table for them.
 // ---------------------------------------------------------------------------
+static RNS::Bytes sm_dest_of(const char* app, const char* aspect, const RNS::Bytes& id);   // below, with sm_last_hop
 struct SmNbr { RNS::Bytes id; double heard; char name[17]; };
 static std::vector<SmNbr> sm_nbrs;                    // max 16, newest first
 class SmAnnounceWatch : public RNS::AnnounceHandler {
 public:
   SmAnnounceWatch() : RNS::AnnounceHandler(nullptr) {}
   void received_announce(const RNS::Bytes& dest, const RNS::Identity& id, const RNS::Bytes& app_data) override {
+    // The library stores a destination's app_data (its announced name) only on
+    // the first announce, to spare the flash, and hands handlers that stored
+    // copy, not the new announce's -- so a rename never reached the Visitors
+    // names, /api/links or Neighbours, not even after a restart. For LXMF and
+    // NomadNet addresses (the names we show) read the app_data from the
+    // announce packet itself (the path table holds the one just validated) and
+    // store it again when it changed: names change rarely, so the flash still
+    // is not written per announce. The entry's packet hash is unused.
+    RNS::Bytes ad = app_data;
+    if (id && ad && ad.size()) {
+      RNS::Bytes ih = id.hash();
+      if (dest == sm_dest_of("lxmf", "delivery", ih) || dest == sm_dest_of("nomadnetwork", "node", ih)) {
+        RNS::Packet p = RNS::Transport::find_announce_packet_from_hash(dest);
+        if (p) {
+          using namespace RNS::Type::Identity;
+          size_t off = KEYSIZE/8 + NAME_HASH_LENGTH/8 + RANDOM_HASH_LENGTH/8 + SIGLENGTH/8
+                     + (p.context_flag() == RNS::Type::Packet::FLAG_SET ? RATCHETSIZE/8 : 0);
+          if (p.data().size() > off) {
+            RNS::Bytes fresh = p.data().mid(off);
+            if (!(fresh == ad)) { RNS::Identity::remember(dest, dest, id.get_public_key(), fresh); ad = fresh; }
+          }
+        }
+      }
+    }
     RNS::Bytes nh = RNS::Transport::next_hop(dest);
     if (!nh || nh.size() != 16) return;
     bool direct = nh == dest || RNS::Transport::hops_to(dest) <= 1;
     SmNbr n; n.id = nh; n.heard = RNS::Utilities::OS::time(); n.name[0] = 0;
     for (size_t i = 0; i < sm_nbrs.size(); i++) if (sm_nbrs[i].id == nh) { memcpy(n.name, sm_nbrs[i].name, sizeof n.name); sm_nbrs.erase(sm_nbrs.begin() + i); break; }
-    if (direct && !n.name[0] && app_data && app_data.size()) {
-      size_t l = app_data.size() < 16 ? app_data.size() : 16; bool ok = true;
-      for (size_t k = 0; k < l; k++) { uint8_t c = app_data.data()[k]; if (c < 0x20 || c == '`') ok = false; }
-      if (ok) { memcpy(n.name, app_data.data(), l); n.name[l] = 0; }
+    // Take the newest plain-text name, not only the first: after a restart the
+    // first one heard is often a cached announce from before a rename, and a
+    // first-wins name kept that stale label until the next restart. Names are
+    // per next hop, so a node announcing two text names would alternate.
+    if (direct && ad && ad.size()) {
+      size_t l = ad.size() < 16 ? ad.size() : 16; bool ok = true;
+      for (size_t k = 0; k < l; k++) { uint8_t c = ad.data()[k]; if (c < 0x20 || c == '`') ok = false; }
+      if (ok) { memcpy(n.name, ad.data(), l); n.name[l] = 0; }
     }
     sm_nbrs.insert(sm_nbrs.begin(), n); if (sm_nbrs.size() > 16) sm_nbrs.pop_back();
   }
@@ -570,14 +733,229 @@ static void P_battery() {
   int p = sm_pct(), f = (p + 5) / 10;
   P("`F%s", p < 25 ? "f55" : p < 50 ? "da3" : "2c5");
   for (int i = 0; i < 10; i++) P(i < f ? "\xE2\x96\x88" : "\xE2\x96\x91");
-  P("`f %d%% %.2fV %s", p, battery_voltage, sm_charging() ? "`F2c5\xE2\x96\xB2`f" : "`Fda3\xE2\x96\xBC`f");
+  // ▲ charging, ● full (charged), ▼ on battery -- all from the Geometric Shapes block, so they render alike
+  // Full also when the shown (rounded) percentage is 100: CHARGED needs exactly 100.0,
+  // so 99.6 % showed "100% ... ▼".
+  bool full = battery_state == BATTERY_STATE_CHARGED || p >= 100;
+  P("`f %d%% %.2fV %s", p, battery_voltage, full ? "`F2c5\xE2\x97\x8F`f" : sm_charging() ? "`F2c5\xE2\x96\xB2`f" : "`Fda3\xE2\x96\xBC`f");
+}
+
+#ifdef SM_LXMF
+// ---------------------------------------------------------------------------
+// LXMF: the node's own lxmf.delivery destination (same identity as the
+// NomadNet node), announced on the same schedule. Admins get single-packet
+// opportunistic messages (running again after a restart, low battery) and can send
+// "status" or "help". No propagation node and no stamps: an alert to an admin
+// whose client is offline is lost, and a client that demands stamps drops it.
+// Wire format: source(16) + signature(64) + msgpack [time, title, content, fields].
+// ---------------------------------------------------------------------------
+static RNS::Destination sm_lxmf({RNS::Type::NONE});
+static uint32_t sm_lxmf_ann_due = 0;
+// What happened last, for the About page (and the log): the Logs page is too
+// short-lived to catch an LXMF exchange.
+static char sm_lxmf_last[56] = "nothing yet"; static uint16_t sm_lxmf_rx_n = 0, sm_lxmf_tx_n = 0;
+static void sm_lxmf_event(const char* fmt, ...) {
+  va_list a; va_start(a, fmt); vsnprintf(sm_lxmf_last, sizeof sm_lxmf_last, fmt, a); va_end(a);
+  NOTICEF("[lxmf] %s", sm_lxmf_last);
+}
+static char sm_fault_note[40] = "";
+
+// Wall clock for message times, learned from requesters (page requests and
+// incoming messages carry the sender's time). Kept apart from the stack's own
+// clock, which the path table runs on. Saved hourly, so after a restart the
+// last known time is used: a little early, but in the right place in a chat.
+static double sm_wall_off = 0; static uint8_t sm_wall_q = 0;   // 0 unknown, 1 last saved, 2 learned
+static double sm_wall() { return sm_wall_q ? RNS::Utilities::OS::time() + sm_wall_off : 0; }
+static void sm_wall_learn(double t) { if (t > 1.7e9 && t < 4.0e9) { sm_wall_off = t - RNS::Utilities::OS::time(); sm_wall_q = 2; } }
+static void sm_wall_boot() { uint32_t w; memcpy(&w, sm.wall, 4); if (w > 1700000000UL) { sm_wall_off = w - RNS::Utilities::OS::time(); sm_wall_q = 1; } }
+static void sm_wall_save() { if (!sm_wall_q) return; uint32_t w = (uint32_t)sm_wall(); memcpy(sm.wall, &w, 4); sm_save(); }
+
+// Admin public keys, saved when an admin opens a page while identified
+// (80 B each, at most 8), so alerts work without hearing their announce.
+struct SmKey { uint8_t id[16]; uint8_t pub[64]; };
+static std::vector<SmKey> sm_keys; static const char* SM_KEYS_PATH = "/scotmesh.key";
+static void sm_keys_load() {
+  RNS::Bytes b; sm_keys.clear();
+  if (!RNS::Utilities::OS::file_exists(SM_KEYS_PATH) || RNS::Utilities::OS::read_file(SM_KEYS_PATH, b) == 0 || b.size() % sizeof(SmKey)) return;
+  for (size_t i = 0; i < b.size() / sizeof(SmKey) && i < 8; i++) { SmKey k; memcpy(&k, b.data() + i * sizeof(SmKey), sizeof(SmKey)); sm_keys.push_back(k); }
+}
+static const SmKey* sm_key_for(const RNS::Bytes& id) {
+  for (auto& k : sm_keys) if (id.size() == 16 && !memcmp(k.id, id.data(), 16)) return &k;
+  return nullptr;
+}
+static void sm_key_seen(const RNS::Identity& who) {
+  if (!who) return;
+  RNS::Bytes id = who.hash(), pub = who.get_public_key();
+  if (!sm_is_admin(id) || sm_key_for(id) || pub.size() != sizeof(SmKey::pub)) return;
+  sm_keys.erase(std::remove_if(sm_keys.begin(), sm_keys.end(), [](const SmKey& k) { return !sm_is_admin(RNS::Bytes(k.id, 16)); }), sm_keys.end());
+  if (sm_keys.size() >= 8) return;
+  SmKey k; memcpy(k.id, id.data(), 16); memcpy(k.pub, pub.data(), sizeof(k.pub)); sm_keys.push_back(k);
+  RNS::Utilities::OS::write_file(SM_KEYS_PATH, RNS::Bytes((const uint8_t*)sm_keys.data(), sm_keys.size() * sizeof(SmKey)));
+  NOTICEF("[lxmf] saved the key of admin %s", id.toHex().c_str());
+}
+// An admin's lxmf.delivery hash (from the identity hash alone) and identity
+// (saved key, else their own announce); the identity is NONE if neither is known.
+static RNS::Identity sm_admin_identity(const RNS::Bytes& id, RNS::Bytes& dest) {
+  RNS::Bytes m = RNS::Destination::name_hash("lxmf", "delivery"); m.append(id); dest = RNS::Identity::full_hash(m).left(16);
+  if (const SmKey* k = sm_key_for(id)) { RNS::Identity i(false); i.load_public_key(RNS::Bytes(k->pub, sizeof(k->pub))); return i; }
+  return RNS::Identity::recall(dest);
+}
+
+static void mp_bin(std::string& o, const char* p, size_t l) {
+  if (l < 256) { o += (char)0xc4; o += (char)l; } else { o += (char)0xc5; o += (char)(l >> 8); o += (char)l; }
+  o.append(p, l);
+}
+static void sm_lxmf_announce() {
+  if (!sm_lxmf) return;
+  std::string a; a += (char)0x92; mp_bin(a, nomadnet_name, strlen(nomadnet_name)); a += (char)0xc0;   // [display name, no stamp cost]
+  sm_lxmf.announce(RNS::Bytes((const uint8_t*)a.data(), a.size()));
+}
+static bool sm_lxmf_send(const RNS::Identity& to, const RNS::Bytes& dest, const std::string& text) {
+  std::string pl; pl += (char)0x94; mp_f64(pl, sm_wall()); mp_bin(pl, "", 0); mp_bin(pl, text.data(), text.size()); pl += (char)0x80;
+  RNS::Bytes src = sm_lxmf.hash(), payload((const uint8_t*)pl.data(), pl.size());
+  RNS::Bytes hashed = dest; hashed.append(src); hashed.append(payload);
+  RNS::Bytes signed_part = hashed; signed_part.append(RNS::Identity::full_hash(hashed));
+  RNS::Bytes data = src; data.append(RNS::Transport::identity().sign(signed_part)); data.append(payload);
+  if (data.size() > 383) return false;            // one encrypted packet (ENCRYPTED_MDU)
+  RNS::Destination out(to, RNS::Type::Destination::OUT, RNS::Type::Destination::SINGLE, "lxmf", "delivery");
+  RNS::Packet(out, data).send();
+  return true;
+}
+
+// Outbox: at most 6 messages; one is tried every 15 s, asking for a path
+// first, and given up on after 10 minutes.
+struct SmOut { RNS::Bytes id; std::string text; uint8_t tries; };
+static std::vector<SmOut> sm_outbox; static uint32_t sm_out_last = 0;
+static void sm_lxmf_queue(const RNS::Bytes& id, const char* text) {
+  if (sm_outbox.size() >= 6) sm_outbox.erase(sm_outbox.begin());
+  sm_outbox.push_back(SmOut{id, std::string(text).substr(0, 240), 0});
+}
+static void sm_alert(const char* text) {
+  if (!sm_lxmf) return;
+  for (auto& id : RNS::Transport::remote_management_allowed()) sm_lxmf_queue(id, text);
+  NOTICEF("[lxmf] alert: %s", text);
+}
+static void sm_outbox_work(uint32_t now) {
+  if (sm_outbox.empty() || now - sm_out_last < 15000UL || sm_power_sleep) return;
+  sm_out_last = now;
+  SmOut m = sm_outbox.front(); sm_outbox.erase(sm_outbox.begin());
+  RNS::Bytes dest; RNS::Identity to = sm_admin_identity(m.id, dest);
+  if (to && RNS::Transport::has_path(dest)) {
+    if (sm_lxmf_send(to, dest, m.text)) { sm_lxmf_tx_n++; sm_lxmf_event("sent to %.8s", m.id.toHex().c_str()); }
+    else sm_lxmf_event("too long for %.8s, dropped", m.id.toHex().c_str());
+    return;
+  }
+  if (m.tries == 0) sm_lxmf_event("no %s for %.8s yet, retrying", to ? "path" : "key", m.id.toHex().c_str());
+  if (++m.tries >= 40) { sm_lxmf_event("no %s for %.8s, dropped", to ? "path" : "key", m.id.toHex().c_str()); return; }
+  if (to && m.tries % 8 == 1) RNS::Transport::request_path(dest);
+  sm_outbox.push_back(m);                          // to the back, so one unreachable admin does not hold up the rest
+}
+
+static std::string sm_status_text() {
+  char b[200]; int n = snprintf(b, sizeof b, "%s: %d%% %.2fV%s, up %s, %u neighbours, %u routes", nomadnet_name, sm_pct(), battery_voltage,
+    sm_charging() ? " charging" : "", sm_up(), (unsigned)sm_nbrs.size(), (unsigned)RNS::Transport::new_path_table().size());
+#ifdef HAS_ENV_SENSORS
+  if (n > 0 && n < (int)sizeof b && EnvSensors::installed() && EnvSensors::read() && !std::isnan(EnvSensors::temperature)) n += snprintf(b + n, sizeof b - n, ", %.1fC", EnvSensors::temperature);
+  if (EnvSensors::power_n && EnvSensors::read_power())
+    for (uint8_t i = 0; i < EnvSensors::power_n && n > 0 && n < (int)sizeof b; i++) {
+      const auto& c = EnvSensors::power[i]; char l[12];
+      if (c.ok) n += snprintf(b + n, sizeof b - n, ", %s %.2fV %.0fmA", EnvSensors::power_label(i, l, sizeof l), c.volts, c.amps * 1000);
+    }
+#else
+  (void)n;
+#endif
+  return b;
+}
+static bool mp_len(const uint8_t* p, size_t n, size_t& i, size_t& len) {   // str or bin header
+  if (i >= n) return false; uint8_t t = p[i++];
+  if ((t & 0xe0) == 0xa0) len = t & 0x1f;
+  else if ((t == 0xc4 || t == 0xd9) && i < n) len = p[i++];
+  else if ((t == 0xc5 || t == 0xda) && i + 1 < n) { len = (p[i] << 8) | p[i + 1]; i += 2; }
+  else return false;
+  return i + len <= n;
+}
+// Incoming message (source + signature + payload): only admins are answered,
+// and only with a valid signature.
+static void sm_lxmf_handle(const RNS::Bytes& data) {
+  sm_lxmf_rx_n++;
+  if (data.size() < 80 + 4) { sm_lxmf_event("message too short (%u B)", (unsigned)data.size()); return; }
+  RNS::Bytes src = data.left(16), sig = data.mid(16, 64), payload = data.mid(80);
+  RNS::Bytes admin, dest; RNS::Identity who({RNS::Type::NONE});
+  for (auto& id : RNS::Transport::remote_management_allowed()) { RNS::Identity i = sm_admin_identity(id, dest); if (dest == src) { admin = id; who = i; break; } }
+  if (!admin) { sm_lxmf_event("from non-admin %.8s, ignored", src.toHex().c_str()); return; }
+  if (!who) { sm_lxmf_event("from %.8s, no key to check it", admin.toHex().c_str()); return; }
+  RNS::Bytes hashed = sm_lxmf.hash(); hashed.append(src); hashed.append(payload);
+  RNS::Bytes signed_part = hashed; signed_part.append(RNS::Identity::full_hash(hashed));
+  if (!who.validate(sig, signed_part)) { sm_lxmf_event("bad signature from %.8s (%02x)", admin.toHex().c_str(), payload.data()[0]); return; }
+  const uint8_t* p = payload.data(); size_t n = payload.size(), i = 1, len = 0;
+  if (p[0] != 0x94 && p[0] != 0x95) { sm_lxmf_event("unknown format %02x from %.8s", p[0], admin.toHex().c_str()); return; }
+  if (p[i] == 0xcb && i + 9 <= n) { uint64_t u = 0; for (int k = 1; k <= 8; k++) u = (u << 8) | p[i + k]; double t; memcpy(&t, &u, 8); sm_wall_learn(t); i += 9; }
+  else if (p[i] == 0xca && i + 5 <= n) i += 5;
+  else { sm_lxmf_event("no timestamp (%02x) from %.8s", p[i], admin.toHex().c_str()); return; }
+  if (!mp_len(p, n, i, len)) { sm_lxmf_event("bad title field from %.8s", admin.toHex().c_str()); return; }
+  i += len;                                         // title
+  if (!mp_len(p, n, i, len)) { sm_lxmf_event("bad content field from %.8s", admin.toHex().c_str()); return; }
+  char cmd[16]; size_t c = 0;
+  for (size_t k = 0; k < len && c < sizeof cmd - 1; k++) { char ch = tolower(p[i + k]); if (ch != ' ' && ch != '\n' && ch != '\r') cmd[c++] = ch; }
+  cmd[c] = 0;
+  sm_lxmf_event("%.8s sent \"%s\", reply queued", admin.toHex().c_str(), cmd);
+  if (!strcmp(cmd, "status")) sm_lxmf_queue(admin, sm_status_text().c_str());
+  else { char h[176]; snprintf(h, sizeof h, "%s understands: status, help. Alerts: running again after a restart, battery below %u%%.", nomadnet_name, sm.pwr_below + 10); sm_lxmf_queue(admin, h); }
+}
+
+// Two ways a message arrives: opportunistic, one packet to the destination
+// (its own address is implied), or "direct" over a Link, as MeshChat and
+// Sideband send by default, where the packed message starts with our address.
+static void sm_lxmf_rx(const RNS::Bytes& data, const RNS::Packet&) { sm_lxmf_handle(data); }
+static void sm_lxmf_link_rx(const RNS::Bytes& data, const RNS::Packet&) {
+  if (data.size() > 16 && data.left(16) == sm_lxmf.hash()) sm_lxmf_handle(data.mid(16));
+  else sm_lxmf_event("link packet not a message (%u B)", (unsigned)data.size());
+}
+static void sm_lxmf_link(RNS::Link& link) { link.set_packet_callback(sm_lxmf_link_rx); sm_lxmf_event("link opened, waiting for a message"); }
+
+void sm_note_fault(bool exception, uint32_t pc, uint32_t lr) {   // from FaultDump.h at boot
+  if (exception) snprintf(sm_fault_note, sizeof sm_fault_note, ", uncaught exception lr=%08lx", (unsigned long)lr);
+  else snprintf(sm_fault_note, sizeof sm_fault_note, ", hard fault pc=%08lx", (unsigned long)pc);
+}
+static void sm_lxmf_loop(uint32_t now, uint64_t up) {
+  if (!sm_lxmf) return;
+  if (sm_lxmf_ann_due && (int32_t)(now - sm_lxmf_ann_due) >= 0) { sm_lxmf_ann_due = 0; sm_lxmf_announce(); NOTICE("[lxmf] start-up announce"); }
+  static bool boot_sent = false;
+  if (!boot_sent && up > 120000ULL) {              // give the node 2 min to hear paths first
+    boot_sent = true; char b[160];
+    snprintf(b, sizeof b, "%s is running again (%s, restart #%lu%s), battery %d%%%s", nomadnet_name, sm_reset_reason, (unsigned long)sm.reboots, sm_fault_note, sm_pct(), sm_charging() ? " charging" : "");
+    sm_alert(b);
+  }
+  static uint32_t last_bat = 0; static bool low_sent = false;
+  if (now - last_bat > 60000UL && battery_voltage > 0.1) {
+    last_bat = now; int warn = sm.pwr_below + 10;   // ahead of the Power page's own action
+    if (!low_sent && sm_pct() < warn) {   // level only, as the power actions below (see there)
+      low_sent = true; char b[96]; snprintf(b, sizeof b, "%s battery low: %d%% %.2fV%s", nomadnet_name, sm_pct(), battery_voltage, sm_charging() ? ", charging" : ""); sm_alert(b);
+    } else if (low_sent && sm_pct() >= warn + 10) low_sent = false;
+  }
+  static uint32_t last_wall = 0;
+  if (now - last_wall > 3600000UL) { last_wall = now; sm_wall_save(); }
+  sm_outbox_work(now);
+}
+#endif
+
+// NomadNet node (and LXMF) announce
+static void sm_announce() {
+  if (nomadnet_destination) nomadnet_destination.announce(RNS::Bytes(nomadnet_name));
+#ifdef SM_LXMF
+  sm_lxmf_announce();
+#endif
 }
 
 // ---------------------------------------------------------------------------
 // Pages
 // ---------------------------------------------------------------------------
 static const char* SM_FLAG = "\xF0\x9F\x8F\xB4\xF3\xA0\x81\xA7\xF3\xA0\x81\xA2\xF3\xA0\x81\xB3\xF3\xA0\x81\xA3\xF3\xA0\x81\xB4\xF3\xA0\x81\xBF";
-static void P_verified(const RNS::Bytes& rid) { if (rid.size()) P("\xF0\x9F\x9B\xA1\xEF\xB8\x8F Verified identity: %s\n", rid.toHex().c_str()); else P(DIM("Not identified") "\n"); }
+static void P_verified(const RNS::Bytes& rid, bool shrt = false) {   // shrt: admin home view, tight budget (full hash on the Admin page)
+  if (!rid.size()) { P(DIM("Not identified") "\n"); return; }
+  std::string h = rid.toHex(); if (shrt) h.resize(8);
+  P("\xF0\x9F\x9B\xA1\xEF\xB8\x8F Verified identity: %s\n", h.c_str());
+}
 static void pg_denied(const RNS::Bytes& rid) {
   Ph("Admins only");
   if (rid.size()) { P("Not on this node's admin list:\n" DIM("%s") "\n", rid.toHex().c_str()); if (sm.pw_on) { PL("Register with a password", 'l'); P("\n"); } }
@@ -585,20 +963,33 @@ static void pg_denied(const RNS::Bytes& rid) {
   PL("Home", 'I');
 }
 
-static void pg_home(const RNS::Bytes& rid) {
+// Visitor's own link: hops as counted on arrival, plus the signal of the last
+// hop (the visitor's own only at 1 hop; otherwise the repeater that delivered it).
+static void P_link(const SmLinkSeen* l, bool admin = false) {   // the home page leaves out "last hop" to stay within budget
+  if (l->hops == 1) P(DIM("Your link") " direct"); else P(DIM("Your link") " %u hops", l->hops);
+  if (l->sig) {
+    P(", %s", admin && l->hops > 1 ? "last hop " : "");
+    if (l->rssi) P("%d dBm / ", l->rssi);
+    P("SNR %.1f dB", l->snr);
+  }
+  P("\n");
+}
+static void pg_home(const RNS::Bytes& rid, const RNS::Bytes& link_id) {
   bool preview = Vis("v", "1"), admin = sm_is_admin(rid) && !preview;
-  static const uint8_t order[] = {SMH_AIR, SMH_RADIO, SMH_PATHS, SMH_UP};   // dropped in this order if over budget
+  static const uint8_t order[] = {SMH_AIR, SMH_NOLINK, SMH_RADIO, SMH_PATHS, SMH_UP};   // dropped in this order if over budget
+  const SmLinkSeen* link = sm_link_find(link_id);
   uint8_t dropped = 0;
-  for (int pass = 0; pass <= 4; pass++) {
+  for (int pass = 0; pass <= 5; pass++) {
     auto show = [&](uint8_t bit) { return ((sm.home & bit) || admin) && !(dropped & bit); };
-    auto star = [&](uint8_t bit) { if (admin && !(sm.home & bit)) P("*"); };
+    auto star = [&](uint8_t bit) { if (admin) P((sm.home & bit) ? " " : "*"); };   // admin: * = hidden from visitors, space keeps the rows aligned
     pb_reset(); P("#!c=0\n");
     if (preview) { P("`Bda3`F000 Visitor view `b`f "); PL("back", 'h'); P("\n"); }
     P(">%s\n", nomadnet_name);
-    if (show(SMH_BAT) || show(SMH_UP) || show(SMH_PATHS) || show(SMH_RADIO) || show(SMH_AIR) || (show(SMH_OP) && sm.op[0])) P(">>Status\n");
+    if (show(SMH_OP) && sm.op[0]) { if (admin && !(sm.home & SMH_OP)) P("*"); P(DIM("Op") " %s\n", sm.op); }   // who runs it: under the name, not a status row (no alignment space: nothing to line up with)
+    if (show(SMH_BAT) || show(SMH_UP) || show(SMH_PATHS) || show(SMH_RADIO) || show(SMH_AIR)) P("\n>>Status\n");   // blank line: air between name and status
     if (show(SMH_BAT)) { star(SMH_BAT); P_battery(); P("\n"); }
     if (show(SMH_UP) || show(SMH_PATHS)) {
-      star(show(SMH_UP) ? SMH_UP : SMH_PATHS); P(DIM("Up") " ");
+      star(show(SMH_UP) ? SMH_UP : SMH_PATHS); P(DIM("Up") "    ");   // padded to "Radio "
       if (show(SMH_UP)) P("%s", sm_up());
       if (show(SMH_PATHS)) {
         char l[20]; snprintf(l, sizeof l, "%u routes", (unsigned)RNS::Transport::new_path_table().size());
@@ -613,13 +1004,21 @@ static void pg_home(const RNS::Bytes& rid) {
       if (show(SMH_AIR)) P("%s%.1f%% air", show(SMH_RADIO) ? ", " : "", airtime * 100);
       P("\n");
     }
-    if (show(SMH_OP) && sm.op[0]) { star(SMH_OP); P(DIM("Op") " %s\n", sm.op); }
     P("<\n");
     if (admin) { PL("Admin", 'a'); P("\n"); }
     else if (rid.size() && sm.pw_on && !preview) { PL("Register", 'l'); P("\n"); }
-    if (!preview) P_verified(rid);
-    P("-\n`c%s ScotMesh microReticulum\n`c%s " MIDDOT " %s", SM_FLAG, SCOTMESH_FW_TAG, BOARD_SHORT_NAME);
-    if (sm_pn <= SM_HOME_BUDGET || pass == 4) break;
+    if (!preview && rid.size()) P_verified(rid, admin);   // "Not identified" told a visitor nothing they could act on
+    if (link && !admin && !(sm.home & SMH_NOLINK) && !(dropped & SMH_NOLINK)) P_link(link);   // admins get it on the Admin page
+    // Footer: local line, ScotMesh credit, firmware + board. The last two can be
+    // hidden from visitors (Home page settings); admins always see them.
+    bool loc = sm_loc.cc[0] || sm_loc.text[0], credit = admin || !(sm.home2 & SMH2_NOCREDIT), ver = admin || !(sm.home2 & SMH2_NOVER);
+    if (loc || credit || ver) {
+      P("-\n`c");                                    // `c toggles and carries over lines (Micron): once for the whole block
+      if (loc) { char fl[9]; sm_flag_of(sm_loc.cc, fl); P("%s%s%s%s", fl, fl[0] && sm_loc.text[0] ? " " : "", sm_loc.text, credit || ver ? "\n" : ""); }
+      if (credit) P("%s ScotMesh microReticulum%s", SM_FLAG, ver ? "\n" : "");
+      if (ver) P("%s " MIDDOT " %s", SCOTMESH_FW_TAG, BOARD_SHORT_NAME);   // last on the page: no `a (it would un-centre this line)
+    }
+    if (sm_pn <= SM_HOME_BUDGET || pass == 5) break;
     dropped |= order[pass];
   }
   if (dropped) NOTICE("[pages] home over budget, optional rows dropped");
@@ -627,30 +1026,52 @@ static void pg_home(const RNS::Bytes& rid) {
 
 // Routes (path table) and neighbours: rows until the row count or the byte budget runs out.
 struct SmListCtx { bool shrt; int o, n, seen, rows; bool more; double now; size_t limit; };
+// Only names routes whose destination is also a cached direct neighbour (see
+// SmAnnounceWatch above) -- multi-hop destinations never had their app_data
+// captured, so they still fall back to the bare hash.
+static const char* sm_nbr_name(const RNS::Bytes& id) {
+  for (auto& n : sm_nbrs) if (n.id == id) return n.name;
+  return nullptr;
+}
 static bool sm_route_row(const RNS::Bytes& k, uint8_t hops, double heard, const RNS::Bytes&, void* vc) {
   SmListCtx& c = *(SmListCtx*)vc;
   if (c.seen++ < c.o) return true;
   if (c.rows >= c.n) { c.more = true; return false; }
-  char age[8]; std::string h = k.toHex(); if (c.shrt) h.resize(8);
-  size_t before = sm_pn; P("%s %u %s\n", h.c_str(), hops, sm_age(c.now - heard, age));
+  char age[8]; const char* name = sm_nbr_name(k);
+  std::string h = k.toHex(); if (c.shrt) h.resize(8);
+  size_t before = sm_pn;
+  P("%-*s %4u %5s", c.shrt ? 8 : 32, h.c_str(), hops, sm_age(c.now - heard, age));   // padded to the header row's columns
+  if (name && name[0]) P("  %s", name);
+  P("\n");
   if (sm_pn > c.limit) { pb_cut(before); c.more = true; return false; }
   c.rows++; return true;
 }
 static void pg_list(bool routes, const RNS::Bytes& rid) {
-  if (!(sm.home & SMH_ROUTES) && !sm_is_admin(rid)) { pg_denied(rid); return; }
+  bool admin = sm_is_admin(rid);
+  if (!(sm.home & SMH_ROUTES) && !admin) { pg_denied(rid); return; }
   char pg = routes ? 'r' : 'b';
-  bool form = Vis("a", "1"), shrt = form ? Fis("s", "1") : Vis("s", "1");
+  bool form = Vis("a", "1");
+  // Default to short hashes (less airtime per page) unless the request says
+  // otherwise -- "s" absent entirely means a fresh link/first load (no
+  // choice made yet), vs "s=0" meaning the user explicitly unchecked Short
+  // on a prior submit or pagination link, which must stick.
+  bool shrt = form ? Fis("s", "1") : (Vv("s")[0] ? Vis("s", "1") : true);
   int n = atoi(form ? Fv("n") : Vv("n")); if (n < 1 || n > 30) n = 10;
   int o = atoi(Vv("o")); if (o < 0) o = 0;
   size_t total = routes ? RNS::Transport::new_path_table().size() : sm_nbrs.size();
-  if (routes) P("#!c=0\n>Routes " DIM("%u " MIDDOT " hops " MIDDOT " heard") "\n", (unsigned)total);
-  else P("#!c=0\n>Neighbours " DIM("heard " MIDDOT " name") "\n");
-  SmListCtx c{shrt, o, n, 0, 0, false, RNS::Utilities::OS::time(), (size_t)(SM_HOME_BUDGET - 165 - (o > 0 ? 36 : 0))};   // room for the footer (+ back link)
+  // Title bar holds only the title; the column names go in a dim header row
+  // padded to the rows' widths, as on the Visitors page.
+  int w = shrt ? 8 : 32;
+  if (routes) P("#!c=0\n>Routes " MIDDOT " %u known\n`F888%-*s hops heard  name`f\n", (unsigned)total, w, "dest");
+  else P("#!c=0\n>Neighbours " MIDDOT " %u heard\n`F888%-*s heard  name`f\n", (unsigned)total, w, "node");
+  SmListCtx c{shrt, o, n, 0, 0, false, RNS::Utilities::OS::time(), (size_t)(SM_HOME_BUDGET - 165 - (o > 0 ? 36 : 0) - (admin ? 49 : 0))};   // room for the footer (+ back link, + Visitors and Device)
   if (routes) sm_walk_paths(sm_route_row, &c);
   else for (size_t i = o; i < sm_nbrs.size(); i++) {
     if (c.rows >= n) { c.more = true; break; }
     char age[8]; std::string h = sm_nbrs[i].id.toHex(); if (shrt) h.resize(8);
-    size_t before = sm_pn; P("%s %s%s%s\n", h.c_str(), sm_age(c.now - sm_nbrs[i].heard, age), sm_nbrs[i].name[0] ? " " : "", sm_nbrs[i].name);
+    size_t before = sm_pn; P("%-*s %5s", w, h.c_str(), sm_age(c.now - sm_nbrs[i].heard, age));
+    if (sm_nbrs[i].name[0]) P("  %s", sm_nbrs[i].name);
+    P("\n");
     if (sm_pn > c.limit) { pb_cut(before); c.more = true; break; }
     c.rows++;
   }
@@ -660,7 +1081,9 @@ static void pg_list(bool routes, const RNS::Bytes& rid) {
   if (o > 0) { P(" "); PLf("back", pg, "s=%d|n=%d|o=%d", shrt, n, o > n ? o - n : 0); }
   char nb[4]; snprintf(nb, sizeof nb, "%d", n);
   P("\nShort "); PC("s", shrt); P(" Rows "); PF(2, "n", nb); P(" "); PL("Apply", pg, "s|n|a=1");
-  P("\n"); PL(routes ? "Neighbours" : "Routes", routes ? 'b' : 'r'); P("  "); PL("Home", 'I');
+  P("\n"); PL(routes ? "Neighbours" : "Routes", routes ? 'b' : 'r'); P("  ");
+  if (admin) { PL("Visitors", 'v'); P("  "); PL("Device", 'd'); P("  "); }
+  PL("Home", 'I');
 }
 
 static void pg_register(const RNS::Bytes& rid) {
@@ -702,11 +1125,158 @@ static void pg_register(const RNS::Bytes& rid) {
 
 // Admin hub and its three sections
 static void P_item(const char* label, char pg, const char* note = "") { PL(label, pg); if (*note) P(" " DIM("%s"), note); P("\n"); }
-static void pg_hub() {
-  Ph(nomadnet_name); P("%d%% " MIDDOT " up %s\n", sm_pct(), sm_up());
-  if (sm_trial) { P("`Fda3! Radio trial`f "); PL("confirm", 'f'); P("\n"); }
-  if (!sm_pending.empty()) { char l[16]; snprintf(l, sizeof l, "%u waiting", (unsigned)sm_pending.size()); P("`Fda3!`f "); PL(l, 'q'); P("\n"); }
-  P("\n>>Admin\n"); PL("Settings", 's'); P("  "); PL("Access", 'c'); P("  "); PL("Device", 'd'); P("\n<\n"); PL("Home", 'I');
+// Who delivered a 2+ hop link: the packet doesn't say (the last repeater strips
+// its transport id), so first ask the path table for our next hop towards the
+// visitor's own LXMF/NomadNet address (worked out from the identity hash, as
+// sm_admin_identity does), else guess from the signal of recently heard repeaters.
+static RNS::Bytes sm_dest_of(const char* app, const char* aspect, const RNS::Bytes& id) {
+  RNS::Bytes m = RNS::Destination::name_hash(app, aspect); m.append(id); return RNS::Identity::full_hash(m).left(16);
+}
+static RNS::Bytes sm_last_hop(const RNS::Bytes& rid, int16_t rssi, bool sig, bool& guessed) {
+  guessed = false;
+  if (rid.size() == 16) for (auto& a : {std::make_pair("lxmf", "delivery"), std::make_pair("nomadnetwork", "node")}) {
+    RNS::Bytes d = sm_dest_of(a.first, a.second, rid);
+    if (RNS::Transport::has_path(d) && RNS::Transport::hops_to(d) > 1) { RNS::Bytes nh = RNS::Transport::next_hop(d); if (nh.size() == 16) return nh; }
+  }
+  if (!sig) return {};
+  const SmRelay *best = nullptr, *second = nullptr; int bd = 999, sd = 999, live = 0; uint32_t now = millis();
+  for (auto& s : sm_relays) {
+    if (!s.at || now - s.at > 24UL * 3600000UL) continue;
+    live++; int d = abs(s.rssi - rssi);
+    if (d < bd) { second = best; sd = bd; best = &s; bd = d; } else if (d < sd) { second = &s; sd = d; }
+  }
+  if (!best || (live > 1 && (bd > 6 || sd - bd < 3))) return {};   // only repeater heard, or a clear match
+  guessed = true; return RNS::Bytes(best->id, 16);
+}
+// A repeater's name: ScotMesh nodes announce NomadNet from their transport identity,
+// so its NomadNet address follows from the transport id; Python nodes stay a hash.
+// Name a destination announced with: the neighbour cache first, else the
+// announce's app_data -- raw text for NomadNet nodes, msgpack [name, stamp
+// cost] for LXMF delivery. buf: 17 bytes. nullptr if there's no usable name.
+static const char* sm_dest_name(const RNS::Bytes& d, char* buf) {
+  const char* n = sm_nbr_name(d); if (n && n[0]) return n;
+  RNS::Bytes ad = RNS::Identity::recall_app_data(d); const uint8_t* p = ad.data(); size_t len = ad.size();
+  if (len > 2 && (p[0] & 0xf0) == 0x90) {                                  // fixarray: LXMF [name, ...]
+    p++; len--;
+    if ((p[0] & 0xe0) == 0xa0) { size_t l = p[0] & 0x1f; p++; len--; if (l < len) len = l; }           // fixstr
+    else if ((p[0] == 0xc4 || p[0] == 0xd9) && len > 1) { size_t l = p[1]; p += 2; len -= 2; if (l < len) len = l; }   // bin8 / str8
+    else return nullptr;
+  }
+  size_t l = len < 16 ? len : 16;
+  while (l > 0 && l < len && (p[l] & 0xc0) == 0x80) l--;                   // don't cut a UTF-8 character in half
+  if (!l) return nullptr;
+  for (size_t k = 0; k < l; k++) if (p[k] < 0x20 || p[k] == '`') return nullptr;
+  memcpy(buf, p, l); buf[l] = 0; return buf;
+}
+// An identified visitor's name: their LXMF display name, else their NomadNet node name.
+static const char* sm_ident_name(const RNS::Bytes& id, char* buf) {
+  if (id.size() != 16) return nullptr;
+  for (auto& a : {std::make_pair("lxmf", "delivery"), std::make_pair("nomadnetwork", "node")})
+    if (const char* n = sm_dest_name(sm_dest_of(a.first, a.second, id), buf)) return n;
+  return nullptr;
+}
+static void P_relay_name(const RNS::Bytes& t) {
+  char buf[17]; const char* name = sm_dest_name(sm_dest_of("nomadnetwork", "node", t), buf);
+  std::string h = t.toHex(); h.resize(8);
+  if (name && name[0]) P("%s " DIM("%s"), name, h.c_str()); else P("%s", h.c_str());
+}
+// Open links as /api/links and the Visitors page show them: longest silent
+// first, since those are the ones sm_links_watchdog() / the pool cap close next.
+typedef std::pair<double, RNS::Link> SmLinkBySilence;   // silence taken once, so the sort sees fixed keys
+static std::vector<SmLinkBySilence> sm_links_by_silence() {
+  std::vector<SmLinkBySilence> ls;
+  for (const auto& ref : RNS::Transport::active_links()) { RNS::Link l = ref; ls.emplace_back(l.no_inbound_for(), l); }
+  std::sort(ls.begin(), ls.end(), [](const SmLinkBySilence& a, const SmLinkBySilence& b) { return a.first > b.first; });
+  return ls;
+}
+// st: p(ending) h(andshake) a(ctive) s(tale) c(losed); hops/rssi from the last
+// packet seen on it (0 once it has dropped out of sm_ls); rid: the visitor's
+// identity if it identified itself; name: that visitor's announced name; via:
+// the repeater that delivers a 2+ hop link, as on the Admin page ("?" = guessed
+// by signal). Empty strings where unknown.
+struct SmLinkRow { char st; long age_s, in_s; uint8_t hops; int16_t rssi; RNS::Bytes rid; char name[17], via[18]; };
+static void sm_link_row(RNS::Link& l, double in_s, double now, SmLinkRow& r) {
+  static const char ST[] = "phasc";
+  uint8_t st = l.status(); r.st = st < 5 ? ST[st] : '?';
+  r.age_s = l.request_time() > 0 ? (long)(now - l.request_time()) : -1; r.in_s = (long)in_s;
+  const RNS::Identity& ri = l.get_remote_identity(); r.rid = ri ? ri.hash() : RNS::Bytes{};
+  const SmLinkSeen* seen = sm_link_find(l.link_id());
+  r.hops = seen ? seen->hops : 0; r.rssi = seen ? seen->rssi : 0;
+  char nb[17]; const char* n = sm_ident_name(r.rid, nb); strcpy(r.name, n ? n : "");
+  r.via[0] = 0;
+  if (seen && seen->hops > 1) {
+    bool guessed; RNS::Bytes t = sm_last_hop(r.rid, seen->rssi, seen->rssi != 0, guessed);
+    if (t) {
+      char vb[17]; const char* vn = sm_dest_name(sm_dest_of("nomadnetwork", "node", t), vb);
+      if (vn) strcpy(r.via, vn); else { std::string h = t.toHex(); h.resize(8); strcpy(r.via, h.c_str()); }
+      if (guessed) strcat(r.via, "?");
+    }
+  }
+}
+// Visitors (admin only): who holds a link to this node right now.
+static void pg_visitors() {
+  int o = atoi(Vv("o")); if (o < 0) o = 0;
+  const int n = 10;
+  auto ls = sm_links_by_silence(); double now = RNS::Utilities::OS::time();
+  // Title bar holds only the title; the column names go in a dim header row
+  // underneath, padded to the same widths as the rows so it reads as a table.
+  P("#!c=0\n>Visitors " MIDDOT " %u open\n" DIM("link      idle  hops  who") "\n", (unsigned)ls.size());
+  const size_t limit = SM_HOME_BUDGET - 173 - (o > 0 ? 36 : 0);   // room for the footer (+ back link)
+  int rows = 0; bool more = false;
+  for (size_t i = o; i < ls.size(); i++) {
+    if (rows >= n) { more = true; break; }
+    SmLinkRow r; sm_link_row(ls[i].second, ls[i].first, now, r);
+    char age[8]; std::string id = ls[i].second.link_id().toHex(); id.resize(8);
+    std::string who = r.name[0] ? std::string(r.name) : r.rid ? r.rid.toHex().substr(0, 8) : std::string("anon");
+    size_t before = sm_pn;
+    char hops[4] = "?"; if (r.hops) snprintf(hops, sizeof hops, "%u", r.hops);
+    P("%-8s %5s %5s  %s", id.c_str(), sm_age(r.in_s, age), hops, who.c_str());   // idle = time since anything was received
+    if (r.st != 'a') P(" " DIM("%c"), r.st);
+    if (r.via[0]) P(" " DIM("via") " %s", r.via);
+    P("\n");
+    if (sm_pn > limit) { pb_cut(before); more = true; break; }
+    rows++;
+  }
+  if (ls.empty()) P(DIM("Nobody connected"));
+  else P(DIM("%d-%d/%u"), rows ? o + 1 : o, o + rows, (unsigned)ls.size());
+  if (more) { P(" "); PLf("next", 'v', "o=%d", o + rows); }
+  if (o > 0) { P(" "); PLf("back", 'v', "o=%d", o > n ? o - n : 0); }
+  P("\n"); PL("Routes", 'r'); P("  "); PL("Neighbours", 'b'); P("  "); PL("Device", 'd'); P("  "); PL("Home", 'I');
+}
+
+// Over several hops with a warning showing (radio trial, waiting
+// registrations) and a long name this page outgrew one packet, and "Page too
+// large" hid the very confirm link it was opened for. Rebuilt until it fits:
+// first without the "Last hop" line (Visitors shows it as "via"), then with
+// the identity shortened to 8 characters, as on the admin home view.
+static void pg_hub(const RNS::Bytes& rid, const RNS::Bytes& link_id) {
+  const SmLinkSeen* l = sm_link_find(link_id);   // the admin home view usually runs over budget and drops it
+  bool guessed = false; RNS::Bytes t;
+  if (l && l->hops > 1) t = sm_last_hop(rid, l->rssi, l->rssi != 0, guessed);   // once: it may read the path table
+  for (int pass = 0; pass < 3; pass++) {
+    pb_reset();
+    Ph(nomadnet_name); P("%d%% " MIDDOT " up %s\n", sm_pct(), sm_up());
+    if (l) {
+      P_link(l, true);
+      if (l->hops > 1 && pass == 0) {
+        P(DIM("Last hop") " ");
+        if (!t) P(DIM("unknown") "\n");
+        else { P_relay_name(t); P(guessed ? "? " DIM("by signal") "\n" : " " DIM("from path table") "\n"); }
+      }
+    }
+    P_verified(rid, pass == 2);
+    if (sm_trial) { P("`Fda3! Radio trial`f "); PL("confirm", 'f'); P("\n"); }
+    if (!sm_pending.empty()) { char w[16]; snprintf(w, sizeof w, "%u waiting", (unsigned)sm_pending.size()); P("`Fda3!`f "); PL(w, 'q'); P("\n"); }
+    P("\n>>Admin\n"); PL("Settings", 's'); P("  "); PL("Access", 'c'); P("  "); PL("Device", 'd');
+#ifdef HAS_ENV_SENSORS
+    P("  "); PL("Telemetry", 't');
+#endif
+#ifdef SM_HISTORY
+    P("  "); PL("History", 'z');
+#endif
+    P("\n<\n"); PL("Home", 'I');
+    if (sm_pn <= SM_HARD_LIMIT) break;
+  }
 }
 static const char* SM_ROLE_NAME[] = {"Fixed relay", "Access point", "Mobile", "End device"};
 static int sm_role() {
@@ -725,13 +1295,24 @@ static void pg_access() {
   Ph("Access"); P_item("Admins", 'k', a); P_item("Password", 'p', sm.pw_on ? "on" : "off"); P_item("Change log", 'j', c); P("\n"); PBACK();
 }
 static void pg_device() {
-  Ph("Device"); P_item("Health", 'e'); P_item("Lights & Bluetooth", 'i', sm.leds == 0 ? "lights on" : sm.leds == 1 ? "lights off" : "lights 10 min");
-  P_item("Logs", 'o'); P_item("Maintenance", 'x'); P_item("Restart & update", 'm'); P_item("About", 'u'); P("\n"); PBACK();
+  Ph("Device"); P_item("Health", 'e');
+  PL("Routes", 'r'); P("  "); PL("Neighbours", 'b'); P("  "); PL("Visitors", 'v'); P("\n"); P_item("Lights & Bluetooth", 'i', sm.leds == 0 ? "lights on" : sm.leds == 1 ? "lights off" : "lights 10 min");
+  P_item("Logs", 'o'); PL("Maintenance", 'x'); P("  "); PL("Announce now", 'x', "a=an"); P("\n");   // the Maintenance action, one tap closer
+  P_item("Restart & update", 'm'); P_item("About", 'u'); P("\n"); PBACK();
 }
 
 static void pg_name(const RNS::Bytes& rid) {
   const char* msg = nullptr; char kind = 'o';
   if (Vis("a", "s")) {
+    char cc[3] = {0}; const char* cf = Fv("cf");
+    for (int i = 0, k = 0; cf[i] && k < 2; i++) if (isalpha((unsigned char)cf[i])) cc[k++] = toupper((unsigned char)cf[i]);
+    if (cc[0] && !cc[1]) cc[0] = 0;                   // one letter is no country code
+    if (Qhas("field_cf") || Qhas("field_ft")) {
+      memcpy(sm_loc.cc, cc, sizeof(cc));
+      strncpy(sm_loc.text, Fv("ft"), sizeof(sm_loc.text) - 1); sm_loc.text[sizeof(sm_loc.text) - 1] = 0;
+      for (int i = strlen(sm_loc.text) - 1; i >= 0 && sm_loc.text[i] == ' '; i--) sm_loc.text[i] = 0;
+      sm_loc_save();
+    }
     char nm[33]; strncpy(nm, Fv("n"), 32); nm[32] = 0; for (int i = strlen(nm) - 1; i >= 0 && nm[i] == ' '; i--) nm[i] = 0;
     if (!nm[0]) { msg = "Name must be 1-32 characters."; kind = 'b'; }
     else {
@@ -743,7 +1324,7 @@ static void pg_name(const RNS::Bytes& rid) {
       RNS::Provisioning::Provisioner::instance().field(PROV_NS_GENERAL, PROV_GENERAL_NOMADNET_NAME, RNS::Provisioning::Value(nomadnet_name));
       RNS::Provisioning::Provisioner::instance().commit(PROV_NS_GENERAL);
 #endif
-      if (ch && nomadnet_destination) nomadnet_destination.announce(RNS::Bytes(nomadnet_name));
+      if (ch) sm_announce();
       sm_change(rid, ch ? "renamed node" : "name page saved");
       msg = ch ? "Saved and announced." : "Saved.";
     }
@@ -752,16 +1333,22 @@ static void pg_name(const RNS::Bytes& rid) {
   Ph("Name & announce"); Pmsg(kind, msg);
   P("Name     "); PF(32, "n", nomadnet_name); P("\nOperator "); PF(22, "o", sm.op); P("\nAnnounce every");
   for (int i = 0; i < 5; i++) { P(" "); PR("ai", AV[i], sm.ann == i); P("%s", AL[i]); }
-  P("\n"); PL("Save", 'n', "n|o|ai|a=s"); P("   "); PBACK();
+  P("\nFlag     "); PF(2, "cf", sm_loc.cc); P(" " DIM("country code, e.g. NL") "\nFooter   "); PF(24, "ft", sm_loc.text);
+  P("\n"); PL("Save", 'n', "n|o|ai|cf|ft|a=s"); P("   "); PBACK('s');
 }
 
 static void pg_homelayout(const RNS::Bytes& rid) {
-  static const struct { uint8_t bit; const char* k; const char* l; } K[] = {{SMH_BAT, "b", "Battery"}, {SMH_UP, "u", "Uptime"}, {SMH_RADIO, "r", "Radio"}, {SMH_PATHS, "d", "Paths"}, {SMH_AIR, "x", "Airtime"}, {SMH_OP, "o", "Operator"}, {SMH_ROUTES, "p", "Routes pages"}};
+  static const struct { uint8_t bit; const char* k; const char* l; } K[] = {{SMH_BAT, "b", "Battery"}, {SMH_UP, "u", "Uptime"}, {SMH_RADIO, "r", "Radio"}, {SMH_PATHS, "d", "Paths"}, {SMH_AIR, "x", "Airtime"}, {SMH_OP, "o", "Operator"}, {SMH_ROUTES, "p", "Routes pages"}, {SMH_NOLINK, "lk", "Visitor's link (hops, signal)"}};
   const char* msg = nullptr;
-  if (Vis("a", "s")) { uint8_t h = 0; for (auto& k : K) if (Fis(k.k, "1")) h |= k.bit; sm.home = h; sm.api = Fis("api", "1"); sm_save(); sm_change(rid, "home page layout"); msg = "Saved."; }
+  if (Vis("a", "s")) {
+    uint8_t h = 0; for (auto& k : K) if (Fis(k.k, "1") != (k.bit == SMH_NOLINK)) h |= k.bit; sm.home = h;
+    sm.home2 = (sm.home2 & ~(SMH2_NOCREDIT | SMH2_NOVER)) | (Fis("cr", "1") ? 0 : SMH2_NOCREDIT) | (Fis("fv", "1") ? 0 : SMH2_NOVER);
+    sm_save(); sm_change(rid, "home page layout"); msg = "Saved.";
+  }
   Ph("Home page"); Pmsg('o', msg); P(DIM("Ticked = public") "\n");
-  for (auto& k : K) { PC(k.k, sm.home & k.bit); P(" %s\n", k.l); }
-  PC("api", sm.api); P(" Telemetry API\n"); PL("Save", 'h', "*|a=s"); P("  "); PL("Preview", 'I', "v=1"); P("  "); PBACK();
+  for (auto& k : K) { PC(k.k, !(sm.home & k.bit) == (k.bit == SMH_NOLINK)); P(" %s\n", k.l); }
+  PC("cr", !(sm.home2 & SMH2_NOCREDIT)); P(" ScotMesh credit\n"); PC("fv", !(sm.home2 & SMH2_NOVER)); P(" Firmware & board\n");
+  PL("Save", 'h', "*|a=s"); P("  "); PL("Preview", 'I', "v=1"); P("  "); PBACK('s');
 }
 
 static void pg_map(const RNS::Bytes& rid) {
@@ -787,7 +1374,7 @@ static void pg_map(const RNS::Bytes& rid) {
     else if (sm_disc_last) P("`F2c5Sent %lu min ago`f\n", (unsigned long)((millis() - sm_disc_last) / 60000));
     else P(DIM("Not sent yet") "\n");
   }
-  PL("Save", 'g', "p|h|pr|on|a=s"); if (sm.map_on) { P("  "); PL("Announce now", 'g', "a=an"); } P("  "); PBACK();
+  PL("Save", 'g', "p|h|pr|on|a=s"); if (sm.map_on) { P("  "); PL("Announce now", 'g', "a=an"); } P("  "); PBACK('s');
 }
 
 static void pg_radio(const RNS::Bytes& rid) {
@@ -809,7 +1396,7 @@ static void pg_radio(const RNS::Bytes& rid) {
   if (sm_trial && !msg) { P("`Fda3Trial: reverts in %lu min`f ", (unsigned long)((sm_trial_until - now) / 60000 + 1)); PL("Keep", 'f', "a=k"); P("\n"); }
   char v[5][12]; snprintf(v[0], 12, "%.3f", lora_freq / 1e6); snprintf(v[1], 12, "%lu", (unsigned long)(lora_bw / 1000)); snprintf(v[2], 12, "%d", lora_sf); snprintf(v[3], 12, "%d", lora_cr); snprintf(v[4], 12, "%d", lora_txp);
   P("MHz "); PF(8, "fq", v[0]); P(" kHz "); PF(3, "bw", v[1]); P("\nSF "); PF(2, "sf", v[2]); P(" CR "); PF(1, "cr", v[3]); P(" dBm "); PF(2, "tx", v[4]); P("\n");
-  PL("Try these", 'f', "fq|bw|sf|cr|tx|a=t"); P("\n" DIM("Preset:") " "); PL("ScotMesh 868", 'f', "a=p|v=868"); P(" "); PL("433", 'f', "a=p|v=433"); P("\n"); PBACK();
+  PL("Try these", 'f', "fq|bw|sf|cr|tx|a=t"); P("\n" DIM("Preset:") " "); PL("ScotMesh 868", 'f', "a=p|v=868"); P(" "); PL("433", 'f', "a=p|v=433"); P("\n"); PBACK('s');
 }
 
 static void pg_role(const RNS::Bytes& rid) {
@@ -829,7 +1416,7 @@ static void pg_role(const RNS::Bytes& rid) {
   int cur = sm_role();
   Ph("Role"); Pmsg('o', msg);
   for (int i = 0; i < 4; i++) { PR("r", RV[i], cur == i); P(" %s " DIM("%s") "\n", SM_ROLE_NAME[i], X[i]); }
-  P(DIM("Relays forward for others; end devices never do.") "\n"); PL("Save", 'w', "r|a=s"); P("  "); PBACK();
+  P(DIM("Relays forward for others; end devices never do.") "\n"); PL("Save", 'w', "r|a=s"); P("  "); PBACK('s');
 }
 
 static void pg_power(const RNS::Bytes& rid) {
@@ -839,24 +1426,51 @@ static void pg_power(const RNS::Bytes& rid) {
     if (n < 5 || n > 60) { msg = "Threshold: 5-60%."; kind = 'b'; }
     else { sm.pwr_below = n; sm.pwr_act = Fis("la", "0") ? 0 : Fis("la", "2") ? 2 : 1; sm.pwr_lock = Fis("bl", "1"); sm_save(); sm_change(rid, "power settings"); msg = "Saved."; }
   }
+#ifdef SM_BAT_CAL
+  // Calibrate: the voltage a meter reads on the pack right now -> factor =
+  // meter / this node's reading (both at the same moment). Within 10 %, else
+  // it's a typo or the wrong probe point rather than ADC error.
+  if (Vis("a", "c")) {
+    float m = atof(Fv("mv")), c = battery_voltage > 1.0f ? battery_cal * m / battery_voltage : 0;
+    if (!(c >= 0.9f && c <= 1.1f)) { msg = battery_voltage > 1.0f ? "Meter >10% off. Check it." : "No battery reading yet."; kind = 'b'; }
+    else { battery_set_cal(c); RNS::Utilities::OS::write_file(SM_CAL_PATH, RNS::Bytes((const uint8_t*)&c, sizeof(c))); sm_change(rid, "battery calibration"); msg = "Calibrated."; }
+  }
+  if (Vis("a", "cz")) { battery_set_cal(1.0f); RNS::Utilities::OS::remove_file(SM_CAL_PATH); sm_change(rid, "battery calibration reset"); msg = "Calibration reset."; }
+#endif
   char lb[4]; snprintf(lb, sizeof lb, "%u", sm.pwr_below);
   Ph("Power"); Pmsg(kind, msg); P("Below "); PF(2, "lb", lb); P("%% battery:\n");
   PR("la", "1", sm.pwr_act == 1); P(" Lower TX power to 10 dBm\n"); PR("la", "2", sm.pwr_act == 2); P(" Radio off until charged\n"); PR("la", "0", sm.pwr_act == 0); P(" Nothing\n");
   PC("bl", sm.pwr_lock); P(" Radio off below 3.3 V\n");
   if (sm_power_limited || sm_power_sleep) Pmsg('a', sm_power_sleep ? "Radio off now (low battery)" : "TX power lowered now");
-  PL("Save", 'y', "lb|la|bl|a=s"); P("  "); PBACK();
+  PL("Save", 'y', "lb|la|bl|a=s"); P("\n");
+#ifdef SM_BAT_CAL
+  P("\nReads %.2f V", battery_voltage); if (battery_cal != 1.0f) P(DIM(" x%.3f"), battery_cal);
+  P("\nMeter "); PF(5, "mv", ""); P(" V "); PL("Calibrate", 'y', "mv|a=c");
+  if (battery_cal != 1.0f) { P(" "); PL("Reset", 'y', "a=cz"); }
+  P("\n");
+#endif
+  PBACK('s');
 }
 
 static void pg_health() {
   Ph("Health");
   P(DIM("RAM") " %u KB free, flash %u KB\n", (unsigned)(RNS::Utilities::Memory::heap_available() / 1024), (unsigned)(RNS::Utilities::OS::storage_available() / 1024));
-  P(DIM("Up") " %s, %lu starts (%s)\n", sm_up(), (unsigned long)sm.reboots, sm_reset_reason);
+  P(DIM("Up") " %s, %lu starts (%s)", sm_up(), (unsigned long)sm.reboots, sm_reset_reason);
+#if MCU_VARIANT == MCU_NRF52
+  P(", %lu tx-fail", (unsigned long)sm_txfails);
+#endif
+  P("\n");
   P(DIM("Radio") " noise %d, last %d/%ddB\n", noise_floor, last_rssi, (int)((int8_t)last_snr_raw) / 4);
   P(DIM("Air") " %.1f%% now, %.1f%% avg\n", airtime * 100, longterm_airtime * 100);
-  P(DIM("Pkts") " rx %lu, tx %lu\n", (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0));
+  P(DIM("Pkts") " rx %lu, tx %lu", (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0));
+#if MODEM == SX1262
+  if (sx126x_modem._missed_rx) P(", %lu missed", (unsigned long)sx126x_modem._missed_rx);   // received packets the radio's interrupt didn't report (should stay 0)
+#endif
+  P("\n");
   P(DIM("Tables") " paths %u/%u, ann %u\nknown %u, links %u, nbrs %u\n", (unsigned)RNS::Transport::new_path_table().size(), (unsigned)RNS::Transport::path_table_maxsize(),
     (unsigned)RNS::Transport::announce_table().size(), (unsigned)RNS::Identity::known_destinations().size(), (unsigned)RNS::Transport::active_links().size(), (unsigned)sm_nbrs.size());
-  PBACK();
+  P(DIM("Closed") " stuck %lu, idle %lu, mem %lu\n", (unsigned long)sm_links_closed_stuck, (unsigned long)sm_links_closed_idle, (unsigned long)sm_links_closed_mem);
+  PBACK('d');
 }
 
 static void pg_lights_bt(const RNS::Bytes& rid) {
@@ -890,13 +1504,13 @@ static void pg_lights_bt(const RNS::Bytes& rid) {
 #endif
   P("\n<\n");
 #endif
-  PBACK();
+  PBACK('d');
 }
 
 static void pg_logs() {
   Ph("Log");
   for (int i = 0; i < sm_log_count; i++) P("%.38s\n", sm_log_ring[(sm_log_next + 5 - sm_log_count + i) % 5]);
-  PL("Refresh", 'o'); P("  "); PBACK();
+  PL("Refresh", 'o'); P("  "); PBACK('d');
 }
 
 static void pg_changes() {
@@ -909,7 +1523,7 @@ static void pg_changes() {
     P("%s ago %s\n" DIM("%s") "\n", sm_age(now - c.t, age), c.what, RNS::Bytes(c.id, 16).toHex().c_str());
   }
   if (o + 3 < (int)total) { PLf("older", 'j', "o=%d", o + 3); P("\n"); }
-  PBACK();
+  PBACK('c');
 }
 
 static void pg_maint(const RNS::Bytes& rid) {
@@ -935,11 +1549,11 @@ static void pg_maint(const RNS::Bytes& rid) {
       uint32_t reboots = sm.reboots; sm = SmConfig(); sm.reboots = reboots; sm_save(); hard_reset();
     }
   }
-  if (!strcmp(a, "an")) { if (nomadnet_destination) nomadnet_destination.announce(RNS::Bytes(nomadnet_name)); sm_change(rid, "announce now"); msg = "Announced."; }
+  if (!strcmp(a, "an")) { sm_announce(); sm_change(rid, "announce now"); msg = "Announced."; }
   if (!strcmp(a, "sc")) { sm.sched = Fis("sm", "d") ? 1 : Fis("sm", "w") ? 2 : 0; sm_save(); sm_change(rid, "auto restart"); msg = "Saved."; }
   Ph("Maintenance"); Pmsg(kind, msg); PL("Announce now", 'x', "a=an");
   P("\n>>Auto restart\n"); PR("sm", "o", sm.sched == 0); P(" Off "); PR("sm", "d", sm.sched == 1); P(" Every day "); PR("sm", "w", sm.sched == 2); P(" Every week "); PL("Save", 'x', "sm|a=sc");
-  P("\n>>Reset\n"); PL("Clear routes & data", 'x', "a=cs"); P("  "); PL("Factory reset", 'x', "a=fr"); P("  "); PL("Full reset", 'x', "a=fx"); P("\n<\n"); PBACK();
+  P("\n>>Reset\n"); PL("Clear routes & data", 'x', "a=cs"); P("  "); PL("Factory reset", 'x', "a=fr"); P("  "); PL("Full reset", 'x', "a=fx"); P("\n<\n"); PBACK('d');
 }
 
 static void pg_update(const RNS::Bytes& rid) {
@@ -973,7 +1587,7 @@ static void pg_update(const RNS::Bytes& rid) {
   bool power_ok = battery_percent >= 30 || sm_charging() || battery_voltage < 0.1;
   if (!strcmp(a, "cw") && sm_has_ota_slot()) {
     if (!power_ok) { Ph("Firmware update"); Pmsg('b', "Battery low and not charging."); P(DIM("Needs 30%% or a charger.") "\n"); PL("Back", 'm'); return; }
-    Ph("WiFi update window?"); P("Restarts as a WiFi access point for\n20 min, off the mesh. Someone in range\nuploads the .bin from the release zip\nat http://192.168.4.1\n`Fda3Someone must be within WiFi range.`f\n\n");
+    Ph("WiFi update window?"); P("Restarts as a WiFi access point for\n20 min, off the mesh. Someone in range\nuploads the .bin from the release zip\nat http://" SM_UPDATE_IP "\n`Fda3Someone must be within WiFi range.`f\n\n");
     PLf("Yes, start", 'm', "a=dw|k=%s", sm_token("cw")); P("\n" DIM("This link works once, for 2 min.")); return;
   }
   if (!strcmp(a, "dw") && sm_has_ota_slot()) {
@@ -982,7 +1596,7 @@ static void pg_update(const RNS::Bytes& rid) {
       RNS::Bytes r = RNS::Cryptography::random(8);
       for (int i = 0; i < 8; i++) sm.upd_pw[i] = "abcdefghjkmnpqrstuvwxyz23456789"[r.data()[i] % 31];
       sm.upd_pw[8] = 0; sm.upd_wifi = 1; sm_save(); sm_change(rid, "WiFi update window");
-      P("#!c=0\n`F2c5Update window opens in a few seconds.`f\nWiFi: ScotMesh-Update\nPassword: %s\nThen open http://192.168.4.1\n" DIM("Write the password down: it is shown once."), sm.upd_pw);
+      P("#!c=0\n`F2c5Update window opens in a few seconds.`f\nWiFi: ScotMesh-Update\nPassword: %s\nThen open http://" SM_UPDATE_IP "\n" DIM("Write the password down: it is shown once."), sm.upd_pw);
       sm_dfu_action = 1; sm_dfu_action_at = millis(); return;
     }
   }
@@ -1001,7 +1615,7 @@ static void pg_update(const RNS::Bytes& rid) {
 #else
   P("This board has one firmware slot:\nupdate over USB.\n");
 #endif
-  P("<\n"); PBACK();
+  P("<\n"); PBACK('d');
 }
 
 static void pg_about() {
@@ -1010,9 +1624,54 @@ static void pg_about() {
   P(DIM("Transport identity") "\n%s\n", RNS::Transport::identity().hash().toHex().c_str());
   P(DIM("Management") "\n%s\n", hx(RNS::Transport::remote_management_destination()).c_str());
   P(DIM("NomadNet") "\n%s\n", hx(nomadnet_destination).c_str());
+#ifdef SM_LXMF
+  P(DIM("LXMF (alerts)") "\n%s\n", hx(sm_lxmf).c_str());
+  P(DIM("LXMF in %u, out %u, last:") "\n%s\n", sm_lxmf_rx_n, sm_lxmf_tx_n, sm_lxmf_last);
+#endif
   P(DIM("Probe") "\n%s\n", hx(RNS::Transport::probe_destination()).c_str());
+  PBACK('d');
+}
+
+#ifdef HAS_ENV_SENSORS
+static void pg_telemetry() {
+  Ph("Telemetry");
+  if (!EnvSensors::installed()) {
+    P(DIM("No environment sensor detected.") "\n");
+  } else if (!EnvSensors::read()) {
+    P(DIM("Sensor read failed.") "\n");
+  } else {
+    if (EnvSensors::humidity_found) P(DIM("Temp") " %.1fC  " DIM("Humidity") " %.1f%%\n", EnvSensors::temperature, EnvSensors::humidity);
+    else P(DIM("Temp") " %.1fC\n", EnvSensors::temperature);
+    if (EnvSensors::pressure_found) {   // altitude from 1013.25 hPa moves with the weather; sea-level pressure (from the Map page height) is what forecasts quote
+      P(DIM("Pressure") " %.1fhPa", EnvSensors::pressure_hpa);
+      if (sm.height != 0) P(" " DIM("sea level") " %.1fhPa\n", EnvSensors::pressure_hpa / powf(1.0f - sm.height / 44330.0f, 5.255f));
+      else P("\n" DIM("Sea level: set the height on the Map page") "\n");
+    }
+    P(DIM("Sensor") " %s\n", EnvSensors::name());
+  }
+  if (EnvSensors::power_n && EnvSensors::read_power()) {
+    for (uint8_t i = 0; i < EnvSensors::power_n; i++) {
+      const auto& c = EnvSensors::power[i]; char l[12];
+      if (c.ok) P(DIM("%s") " %.2fV %.0fmA %.2fW\n", EnvSensors::power_label(i, l, sizeof l), c.volts, c.amps * 1000, c.volts * c.amps);
+    }
+  }
+#if MCU_VARIANT == MCU_NRF52
+  P(DIM("MCU") " %.1fC\n", (double)readCPUTemperature());
+#endif
+  if (EnvSensors::chip_n > 1) {                   // each chip on its own; dropped if the page would not fit
+    for (uint8_t i = 0; i < EnvSensors::chip_n; i++) {
+      const auto& c = EnvSensors::chips[i]; if (!c.ok) continue;
+      size_t at = sm_pn; P(DIM("%s"), EnvSensors::chip_name(c.id));
+      if (!std::isnan(c.t)) P(" %.1fC", c.t);
+      if (!std::isnan(c.h)) P(" %.0f%%", c.h);
+      if (!std::isnan(c.p_hpa)) P(" %.1fhPa", c.p_hpa);
+      P("\n");
+      if (sm_pn > SM_HARD_LIMIT - 26) { pb_cut(at); break; }
+    }
+  }
   PBACK();
 }
+#endif
 
 static void pg_admins(const RNS::Bytes& rid) {
   const char* msg = nullptr; char kind = 'o'; const char* a = Vv("a"); int o = atoi(Vv("o")); if (o < 0) o = 0;
@@ -1044,11 +1703,15 @@ static void pg_admins(const RNS::Bytes& rid) {
   P("#!c=0\n>Admins " DIM("%u/8") "\n", (unsigned)list.size()); Pmsg(kind, msg);
   for (int i = o; i < (int)list.size() && i < o + 3; i++) {
     std::string h = list[i].toHex();
-    if (list[i] == rid) P("%s `F2c5you`f\n", h.c_str()); else { PLf(h.c_str(), 'k', "a=rm|i=%d", i); P("\n"); }
+    if (list[i] == rid) P("%s `F2c5you`f", h.c_str()); else PLf(h.c_str(), 'k', "a=rm|i=%d", i);
+#ifdef SM_LXMF
+    if (sm_key_for(list[i])) P(" " DIM("key"));
+#endif
+    P("\n");
   }
   if ((int)list.size() > 3) { PLf("more", 'k', "o=%d", o + 3 < (int)list.size() ? o + 3 : 0); P("\n"); }
   if (list.size() < 8) { P(DIM("Add") " "); PF(32, "h", ""); P(" "); PL("Add", 'k', "h|a=ad"); P("\n"); }
-  PBACK();
+  PBACK('c');
 }
 
 static void pg_queue(const RNS::Bytes& rid) {
@@ -1084,9 +1747,166 @@ static void pg_password(const RNS::Bytes& rid) {
   Ph("Password registration"); Pmsg(kind, msg);
   if ((int32_t)(sm_reg_paused_until - millis()) > 0) Pmsg('b', "Paused after 10 wrong tries");
   PC("e", sm.pw_on); P(" On   "); PC("v", sm.pw_approval); P(" Needs approval\nNew   `<!16|p1`>\nAgain `<!16|p2`> blank=keep\n");
-  PL("Save", 'p', "e|v|p1|p2|a=s"); P("  "); PBACK();
+  PL("Save", 'p', "e|v|p1|p2|a=s"); P("  "); PBACK('c');
   if (sm_last_attempt[0]) P("\n>>Last attempt\n%s", sm_last_attempt);
 }
+
+#ifdef SM_HISTORY
+// ---------------------------------------------------------------------------
+// Telemetry history: a sample every 10 min, averaged into one 16 B record an
+// hour, 168 records (7 days, ~2.7 KB) in one flash file, oldest first. There
+// is no wall clock, so records are placed by counting back from the newest;
+// the first record after a start carries SMF_BOOT, as the time off is unknown.
+// ---------------------------------------------------------------------------
+#define SM_HIST_MAX 168
+enum : uint8_t { SMF_BOOT = 1, SMF_CHG = 2, SMF_ENV = 4, SMF_HUM = 8, SMF_HPA = 16, SMF_MCU = 32 };
+struct SmHist { uint8_t f, pct; uint16_t mv; int16_t t10; int8_t tmin, tmax; uint8_t hum, nbrs; uint16_t hpa10, paths; int8_t mcu; uint8_t pad; };
+static_assert(sizeof(SmHist) == 16, "history record must stay 16 B (on-flash format)");
+struct SmAcc { uint32_t mv, pct; int32_t t10, hpa10, hum, mcu; int16_t tmin, tmax; uint8_t n, nb, nt, nh, np, nm; bool chg; };
+static SmAcc sm_acc; static bool sm_hist_boot = true; static uint32_t sm_hist_at = 0;
+static uint32_t sm_hist_last = 60000UL - 600000UL;   // wraps: first sample 1 min after start, then every 10 min
+static void sm_acc_reset() { sm_acc = SmAcc{}; sm_acc.tmin = INT16_MAX; sm_acc.tmax = INT16_MIN; }
+static int8_t sm_i8(double v) { return v < -127 ? -127 : v > 127 ? 127 : (int8_t)v; }
+static size_t sm_hist_read(RNS::Bytes& b) {
+  if (!RNS::Utilities::OS::file_exists(SM_HIST_PATH) || RNS::Utilities::OS::read_file(SM_HIST_PATH, b) == 0 || b.size() % sizeof(SmHist)) return 0;
+  return b.size() / sizeof(SmHist);
+}
+static void sm_hist_sample() {
+  SmAcc& a = sm_acc; if (!a.n) sm_acc_reset();
+  if (battery_voltage > 0.1) { a.mv += (uint32_t)(battery_voltage * 1000 + 0.5); a.pct += sm_pct(); a.nb++; if (sm_charging()) a.chg = true; }
+#ifdef HAS_ENV_SENSORS
+  if (EnvSensors::installed() && EnvSensors::read() && !std::isnan(EnvSensors::temperature)) {
+    int t = (int)std::lround(EnvSensors::temperature * 10); a.t10 += t; a.nt++;
+    if (t < a.tmin) a.tmin = t;
+    if (t > a.tmax) a.tmax = t;
+    if (EnvSensors::humidity_found) { a.hum += std::lround(EnvSensors::humidity); a.nh++; }
+    if (EnvSensors::pressure_found) { a.hpa10 += std::lround(EnvSensors::pressure_hpa * 10); a.np++; }
+  }
+#endif
+#if MCU_VARIANT == MCU_NRF52
+  a.mcu += std::lround(readCPUTemperature()); a.nm++;
+#endif
+  a.n++;
+}
+static void sm_hist_write() {
+  SmAcc& a = sm_acc; SmHist h{};
+  h.f = (sm_hist_boot ? SMF_BOOT : 0) | (a.chg ? SMF_CHG : 0);
+  if (a.nb) { h.mv = a.mv / a.nb; h.pct = a.pct / a.nb; }
+  if (a.nt) { h.f |= SMF_ENV; h.t10 = a.t10 / a.nt; h.tmin = sm_i8(std::floor(a.tmin / 10.0)); h.tmax = sm_i8(std::ceil(a.tmax / 10.0)); }
+  if (a.nh) { h.f |= SMF_HUM; h.hum = a.hum / a.nh; }
+  if (a.np) { h.f |= SMF_HPA; h.hpa10 = a.hpa10 / a.np; }
+  if (a.nm) { h.f |= SMF_MCU; h.mcu = sm_i8((double)a.mcu / a.nm); }
+  h.nbrs = sm_nbrs.size() > 255 ? 255 : sm_nbrs.size();
+  size_t pt = RNS::Transport::new_path_table().size(); h.paths = pt > 65535 ? 65535 : pt;
+  RNS::Bytes old; size_t n = sm_hist_read(old), keep = n >= SM_HIST_MAX ? SM_HIST_MAX - 1 : n;
+  RNS::Bytes out = keep ? RNS::Bytes(old.data() + (n - keep) * sizeof(SmHist), keep * sizeof(SmHist)) : RNS::Bytes((const uint8_t*)&h, sizeof(h));
+  if (keep) out.append((const uint8_t*)&h, sizeof(h));
+  RNS::Utilities::OS::write_file(SM_HIST_PATH, out);
+  sm_hist_boot = false; sm_hist_at = millis(); a.n = 0;
+}
+static void sm_hist_loop(uint32_t now) {
+  if (now - sm_hist_last < 600000UL) return;
+  sm_hist_last = now; sm_hist_sample();
+  if (sm_acc.n >= 6) sm_hist_write();
+}
+
+// History page: 24 h battery sparkline, then summaries; optional lines are
+// dropped if they would push the page past one packet.
+static void pg_history() {
+  RNS::Bytes b; size_t n = sm_hist_read(b);
+  Ph("History");
+  if (!n) {                                       // nothing stored yet: show the hour being collected
+    const SmAcc& a = sm_acc;
+    if (!a.n) { P(DIM("First sample 1 min after start.") "\n"); PBACK(); return; }
+    P("First hour: %u/6 samples\n", a.n);
+    if (a.nb) P(DIM("bat") " %lu%% %.2fV%s\n", (unsigned long)(a.pct / a.nb), a.mv / (double)a.nb / 1000.0, a.chg ? " charging" : "");
+    if (a.nt) P(DIM("temp") " %.1fC", a.t10 / (double)a.nt / 10.0);
+    if (a.nh) P(" %ld%%", (long)(a.hum / a.nh));
+    if (a.np) P(" %.0fhPa", a.hpa10 / (double)a.np / 10.0);
+    if (a.nt || a.nh || a.np) P("\n");
+    if (a.nm) P(DIM("mcu") " %ldC\n", (long)(a.mcu / a.nm));
+    PBACK(); return;
+  }
+  const SmHist* h = (const SmHist*)b.data(); size_t d0 = n > 24 ? n - 24 : 0;
+  P(DIM("bat") " `F2c5");
+  int marks = 0;
+  for (size_t i = d0; i < n; i++) {
+    if ((h[i].f & SMF_BOOT) && i > d0 && marks++ < 3) P("`Fda3|`F2c5");
+    if (!h[i].mv) P(" "); else { char s[4] = {'\xE2', '\x96', (char)(0x81 + (h[i].pct * 8 / 101))}; P("%s", s); }
+  }
+  P("`f\n");
+  int mn = 101, mx = -1, best = 0, bh = 0; long start = -1;
+  for (size_t i = d0; i < n; i++) {
+    if (!h[i].mv) { start = -1; continue; }
+    if (h[i].pct < mn) mn = h[i].pct;
+    if (h[i].pct > mx) mx = h[i].pct;
+    if ((h[i].f & (SMF_CHG | SMF_BOOT)) || start < 0) { start = (h[i].f & SMF_CHG) ? -1 : (long)i; continue; }
+    int drop = h[start].pct - h[i].pct; if (drop > best) { best = drop; bh = i - start; }
+  }
+  if (mx >= 0) { P("%u%% now " MIDDOT " 24h %d-%d%%", h[n - 1].pct, mn, mx); if (best > 0) P(" " MIDDOT " -%d%%/%dh", best, bh); P("\n"); }
+  const size_t room = SM_HARD_LIMIT - 26;         // keep space for the back link
+  auto fit = [&](size_t before) { if (sm_pn > room) pb_cut(before); };
+  size_t at = sm_pn; P(DIM("days"));
+  for (size_t d = 0; d < 7 && d * 24 < n; d++) {
+    size_t hi = n - d * 24, lo = hi > 24 ? hi - 24 : 0; int a = 101, z = -1;
+    for (size_t i = lo; i < hi; i++) if (h[i].mv) { if (h[i].pct < a) a = h[i].pct; if (h[i].pct > z) z = h[i].pct; }
+    if (z >= 0) P(" %d-%d", a, z); else P(" -");
+  }
+  P("\n"); fit(at);
+  int t0 = 127, t1 = -127, w0 = 127, w1 = -127, m0 = 127, m1 = -127, u0 = 255, u1 = -1, p0 = -1, p1 = -1, nb1 = 0;
+  for (size_t i = 0; i < n; i++) {
+    bool day = i >= d0;
+    if (h[i].f & SMF_ENV) { if (h[i].tmin < w0) w0 = h[i].tmin; if (h[i].tmax > w1) w1 = h[i].tmax; if (day) { if (h[i].tmin < t0) t0 = h[i].tmin; if (h[i].tmax > t1) t1 = h[i].tmax; } }
+    if (!day) continue;
+    if (h[i].f & SMF_MCU) { if (h[i].mcu < m0) m0 = h[i].mcu; if (h[i].mcu > m1) m1 = h[i].mcu; }
+    if (h[i].f & SMF_HUM) { if (h[i].hum < u0) u0 = h[i].hum; if (h[i].hum > u1) u1 = h[i].hum; }
+    if (h[i].f & SMF_HPA) { if (p0 < 0) p0 = h[i].hpa10; p1 = h[i].hpa10; }
+    if (h[i].nbrs > nb1) nb1 = h[i].nbrs;
+  }
+  if (t1 >= t0 || m1 >= m0) {
+    at = sm_pn; P(DIM("temp"));
+    if (t1 >= t0) P(" %d/%dC 7d %d/%dC", t0, t1, w0, w1);
+    if (m1 >= m0) P(" " MIDDOT " mcu %d/%dC", m0, m1);
+    P("\n"); fit(at);
+  }
+  if (u1 >= 0 || p1 >= 0) {
+    at = sm_pn; P(DIM("air"));
+    if (u1 >= 0) P(" %d-%d%%", u0, u1);
+    if (p1 >= 0) P(" " MIDDOT " %d>%dhPa", (p0 + 5) / 10, (p1 + 5) / 10);
+    P("\n"); fit(at);
+  }
+  at = sm_pn; P(DIM("mesh") " %u nbrs (max %d) " MIDDOT " %u routes\n", h[n - 1].nbrs, nb1, h[n - 1].paths); fit(at);
+  char ag[8]; at = sm_pn; P(DIM("%uh, newest %s ago") "\n", (unsigned)n, sm_age((millis() - sm_hist_at) / 1000.0, ag));
+  if (!sm_hist_at) pb_cut(at); else fit(at);     // the newest record's age is only known for this run
+  PBACK();
+}
+
+// /api/hist: newest first, `o` hours back, `n` rows (default 6, max 24).
+static void J_hist() {
+  RNS::Bytes b; size_t n = sm_hist_read(b); const SmHist* h = (const SmHist*)b.data();
+  int o = atoi(Qa("o")), want = Qahas("n") ? atoi(Qa("n")) : 6;
+  if (o < 0) o = 0;
+  if (want < 1) want = 1;
+  if (want > 24) want = 24;
+  P("{\"total\":%u,\"o\":%d,", (unsigned)n, o);
+  if (sm_hist_at) P("\"last_s\":%lu,", (unsigned long)((millis() - sm_hist_at) / 1000));
+  P("\"cols\":[\"h\",\"pct\",\"mv\",\"chg\",\"t\",\"hum\",\"hpa\",\"mcu\",\"nbrs\",\"paths\",\"boot\"],\"rows\":[");
+  int rows = 0; bool more = false;
+  for (long i = (long)n - 1 - o; i >= 0; i--) {
+    if (rows >= want) { more = true; break; }
+    const SmHist& r = h[i]; size_t before = sm_pn;
+    P("%s[%ld,%u,%u,%d,", rows ? "," : "", (long)n - 1 - i, r.pct, r.mv, (r.f & SMF_CHG) ? 1 : 0);
+    if (r.f & SMF_ENV) P("%.1f,", r.t10 / 10.0); else P("null,");
+    if (r.f & SMF_HUM) P("%u,", r.hum); else P("null,");
+    if (r.f & SMF_HPA) P("%.1f,", r.hpa10 / 10.0); else P("null,");
+    if (r.f & SMF_MCU) P("%d,", r.mcu); else P("null,");
+    P("%u,%u,%d]", r.nbrs, r.paths, (r.f & SMF_BOOT) ? 1 : 0);
+    if (sm_pn > SM_HOME_BUDGET - 16) { pb_cut(before); more = true; break; }
+    rows++;
+  }
+  P(more ? "],\"more\":true}" : "]}");
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // Telemetry API (JSON, no micron, open to unidentified clients)
@@ -1097,7 +1917,58 @@ static void J_net() {
   P("\"routes\":%u,\"neighbours\":%u,\"rx\":%lu,\"tx\":%lu,\"links\":%u", (unsigned)RNS::Transport::new_path_table().size(), (unsigned)sm_nbrs.size(),
     (unsigned long)(lora_interface ? lora_interface.rx() : 0), (unsigned long)(lora_interface ? lora_interface.tx() : 0), (unsigned)RNS::Transport::active_links().size());
 }
-static void J_ram() { P("\"free_ram\":%u,\"free_flash\":%u", (unsigned)RNS::Utilities::Memory::heap_available(), (unsigned)RNS::Utilities::OS::storage_available()); }
+// free_ram is the general system heap (dbgHeapFree on nRF52) -- NOT the TLSF
+// pool Reticulum Links/Packets/Bytes actually allocate from (RNS_CONTAINER_
+// ALLOCATOR=RNS_HEAP_POOL_ALLOCATOR, see platformio.ini). free_pool/
+// pool_fragmented expose that pool directly, so link-driven memory pressure
+// is actually visible instead of inferred from a stat that doesn't move
+// with link count.
+static void J_ram() {
+  P("\"free_ram\":%u,\"free_flash\":%u,\"free_pool\":%u,\"pool_fragmented\":%u",
+    (unsigned)RNS::Utilities::Memory::heap_available(), (unsigned)RNS::Utilities::OS::storage_available(),
+    (unsigned)RNS::Utilities::Memory::heap_pool_free(), (unsigned)RNS::Utilities::Memory::heap_pool_fragmented());
+  P(",\"links_closed_stuck\":%lu,\"links_closed_idle\":%lu,\"links_closed_mem\":%lu",
+    (unsigned long)sm_links_closed_stuck, (unsigned long)sm_links_closed_idle, (unsigned long)sm_links_closed_mem);
+#if MCU_VARIANT == MCU_NRF52
+  P(",\"tx_fail\":%lu", (unsigned long)sm_txfails);
+#endif
+}
+#ifdef HAS_ENV_SENSORS
+static void J_env() {
+  if (!EnvSensors::installed() && !EnvSensors::power_n) { P("\"error\":\"no sensor\""); return; }
+  if (EnvSensors::installed()) {
+    EnvSensors::read();
+    P("\"temp\":%.1f", (double)EnvSensors::temperature);
+    if (EnvSensors::humidity_found) P(",\"humidity\":%.1f", (double)EnvSensors::humidity);
+    if (EnvSensors::pressure_found) P(",\"pressure\":%.1f,\"altitude\":%.0f", (double)EnvSensors::pressure_hpa, (double)EnvSensors::altitude_m);
+    P(",");
+  }
+  P("\"sensor\":\"%s\"", EnvSensors::name());
+  if (EnvSensors::power_n) {                      // [label, volts, amps] per channel; null when that read failed
+    EnvSensors::read_power(); P(",\"power\":[");
+    for (uint8_t i = 0; i < EnvSensors::power_n; i++) {
+      const auto& c = EnvSensors::power[i]; char l[12]; EnvSensors::power_label(i, l, sizeof l);
+      if (c.ok) P("%s[\"%s\",%.2f,%.3f]", i ? "," : "", l, c.volts, c.amps); else P("%s[\"%s\",null,null]", i ? "," : "", l);
+    }
+    P("]");
+  }
+#if MCU_VARIANT == MCU_NRF52
+  P(",\"mcu_temp\":%.1f", (double)readCPUTemperature());
+#endif
+  if (EnvSensors::chip_n > 1) {                   // [name, temp, humidity, pressure] per chip; left out if it would not fit
+    size_t at = sm_pn; P(",\"chips\":[");
+    for (uint8_t i = 0; i < EnvSensors::chip_n; i++) {
+      const auto& c = EnvSensors::chips[i];
+      P("%s[\"%s\"", i ? "," : "", EnvSensors::chip_name(c.id));
+      if (c.ok && !std::isnan(c.t)) P(",%.1f", c.t); else P(",null");
+      if (c.ok && !std::isnan(c.h)) P(",%.1f", c.h); else P(",null");
+      if (c.ok && !std::isnan(c.p_hpa)) P(",%.1f]", c.p_hpa); else P(",null]");
+    }
+    P("]");
+    if (sm_pn > SM_HOME_BUDGET - 2) pb_cut(at);
+  }
+}
+#endif
 static void J_clean(char* s) { for (; *s; s++) if (*s == '"' || *s == '\\') *s = '\''; }
 struct SmApiCtx { bool shrt; int o, n, seen, rows; bool more; double now; };
 static bool sm_api_path_row(const RNS::Bytes& k, uint8_t hops, double heard, const RNS::Bytes& via, void* vc) {
@@ -1109,14 +1980,19 @@ static bool sm_api_path_row(const RNS::Bytes& k, uint8_t hops, double heard, con
   if (sm_pn > SM_HOME_BUDGET - 16) { pb_cut(before); c.more = true; return false; }
   c.rows++; return true;
 }
-static void api_reply(const char* path) {
-  if (!sm.api) { P("{\"error\":\"api disabled\"}"); return; }
+static void api_reply(const char* path, const RNS::Bytes& rid) {
   const char* e = path + 4; if (*e == '/') e++;
-  if (!*e) { P("{\"v\":1,\"api\":[\"bat\",\"up\",\"radio\",\"net\",\"sys\",\"health\",\"pos\",\"paths\",\"nbrs\",\"all\"]}"); return; }
+  if (!*e) { P("{\"v\":1,\"api\":[\"bat\",\"up\",\"radio\",\"net\",\"sys\",\"health\",\"pos\",\"paths\",\"nbrs\",\"links\",\"all\"" SM_API_ENV_NAME SM_API_HIST_NAME "]}"); return; }
   if (!strcmp(e, "bat")) { P("{"); J_bat(); P("}"); return; }
   if (!strcmp(e, "up")) { P("{"); J_up(); P("}"); return; }
   if (!strcmp(e, "net")) { P("{"); J_net(); P("}"); return; }
   if (!strcmp(e, "all")) { P("{"); J_bat(); P(","); J_up(); P(","); J_net(); P(",\"airtime\":%.1f}", airtime * 100); return; }
+#ifdef HAS_ENV_SENSORS
+  if (!strcmp(e, "env")) { P("{"); J_env(); P("}"); return; }
+#endif
+#ifdef SM_HISTORY
+  if (!strcmp(e, "hist")) { J_hist(); return; }
+#endif
   if (!strcmp(e, "radio")) {
     P("{\"freq\":%lu,\"bw\":%lu,\"sf\":%d,\"cr\":%d,\"txp\":%d,\"airtime\":%.1f,\"noise\":%d,\"rssi\":%d,\"snr\":%d}",
       (unsigned long)lora_freq, (unsigned long)lora_bw, lora_sf, lora_cr, lora_txp, airtime * 100, noise_floor, last_rssi, (int)((int8_t)last_snr_raw) / 4);
@@ -1133,15 +2009,39 @@ static void api_reply(const char* path) {
     double la = sm.lat, lo = sm.lon; if (sm.map_coarse) { la = std::round(la * 100) / 100; lo = std::round(lo * 100) / 100; }
     P("{\"lat\":%.5f,\"lon\":%.5f,\"height\":%d}", la, lo, (int)sm.height); return;
   }
-  bool paths = !strcmp(e, "paths"), nbrs = !strcmp(e, "nbrs");
-  if (!paths && !nbrs) { P("{\"error\":\"unknown endpoint\",\"see\":\"/api\"}"); return; }
-  SmApiCtx c{!strcmp(Q("s"), "1"), atoi(Q("o")), Qhas("n") ? atoi(Q("n")) : 5, 0, 0, false, RNS::Utilities::OS::time()};
+  bool paths = !strcmp(e, "paths"), nbrs = !strcmp(e, "nbrs"), links = !strcmp(e, "links");
+  if (!paths && !nbrs && !links) { P("{\"error\":\"unknown endpoint\",\"see\":\"/api\"}"); return; }
+  SmApiCtx c{!strcmp(Qa("s"), "1"), atoi(Qa("o")), Qahas("n") ? atoi(Qa("n")) : 5, 0, 0, false, RNS::Utilities::OS::time()};
   if (c.o < 0) c.o = 0;
   if (c.n < 1) c.n = 1;
   if (c.n > 15) c.n = 15;
   if (paths) {
     P("{\"total\":%u,\"o\":%d,\"cols\":[\"dest\",\"hops\",\"age_s\",\"via\"],\"rows\":[", (unsigned)RNS::Transport::new_path_table().size(), c.o);
     sm_walk_paths(sm_api_path_row, &c);
+  } else if (links) {
+    // cols as SmLinkRow; who/name/via null where unknown. who/name come from an
+    // identify sent only to this node, so they are admin only, like the Visitors
+    // page. via is hidden too: it ties a live session to the area around one
+    // repeater (privacy default; can be made public if wanted).
+    bool admin = sm_is_admin(rid);
+    auto ls = sm_links_by_silence();
+    P("{\"total\":%u,\"o\":%d,\"cols\":[\"link\",\"st\",\"age_s\",\"in_s\",\"hops\",\"rssi\",\"who\",\"name\",\"via\"],\"rows\":[", (unsigned)ls.size(), c.o);
+    for (size_t i = c.o; i < ls.size(); i++) {
+      if (c.rows >= c.n) { c.more = true; break; }
+      SmLinkRow r; sm_link_row(ls[i].second, ls[i].first, c.now, r);
+      if (!admin) { r.rid = RNS::Bytes{}; r.name[0] = 0; r.via[0] = 0; }
+      std::string id = ls[i].second.link_id().toHex(); if (c.shrt) id.resize(8);
+      std::string who = r.rid.toHex(); if (c.shrt && who.size() > 8) who.resize(8);
+      auto js = [](const char* v) { if (!*v) return std::string("null"); char t[20]; strncpy(t, v, 19); t[19] = 0; J_clean(t); return "\"" + std::string(t) + "\""; };
+      char hops[6] = "null", rssi[8] = "null";
+      if (r.hops) snprintf(hops, sizeof hops, "%u", r.hops);
+      if (r.rssi) snprintf(rssi, sizeof rssi, "%d", r.rssi);
+      size_t before = sm_pn;
+      P("%s[\"%s\",\"%c\",%ld,%ld,%s,%s,%s,%s,%s]", c.rows ? "," : "", id.c_str(), r.st, r.age_s, r.in_s, hops, rssi,
+        js(who.c_str()).c_str(), js(r.name).c_str(), js(r.via).c_str());
+      if (sm_pn > SM_HOME_BUDGET - 16) { pb_cut(before); c.more = true; break; }
+      c.rows++;
+    }
   } else {
     P("{\"total\":%u,\"o\":%d,\"cols\":[\"dest\",\"age_s\",\"name\"],\"rows\":[", (unsigned)sm_nbrs.size(), c.o);
     for (size_t i = c.o; i < sm_nbrs.size(); i++) {
@@ -1162,18 +2062,22 @@ static void api_reply(const char* path) {
 RNS::Bytes sm_serve(const RNS::Bytes& path_b, const RNS::Bytes& data, const RNS::Bytes& request_id, const RNS::Bytes& link_id, const RNS::Identity& remote_identity, double requested_at) {
   char path[24]; size_t pl = path_b.size() < sizeof(path) - 1 ? path_b.size() : sizeof(path) - 1; memcpy(path, path_b.data(), pl); path[pl] = 0;
   RNS::Bytes rid = remote_identity ? remote_identity.hash() : RNS::Bytes{};
+#ifdef SM_LXMF
+  sm_wall_learn(requested_at);
+  if (rid.size()) sm_key_seen(remote_identity);
+#endif
   bool api = !strncmp(path, "/api", 4);
   pb_reset();
   if (RNS::Utilities::Memory::heap_available() < SM_RAM_FLOOR) P(api ? "{\"error\":\"busy\"}" : "#!c=0\n>Busy\nLow on memory, try again later.");
-  else if (sm_parse(data), api) api_reply(path);
+  else if (sm_parse(data), api) api_reply(path, rid);
   else {
     char pg = !strcmp(path, "/page/index.mu") ? 'I' : (strlen(path) == 10 && !strcmp(path + 7, ".mu")) ? path[6] : '?';
-    if (pg == 'I') pg_home(rid);
+    if (pg == 'I') pg_home(rid, link_id);
     else if (pg == 'r' || pg == 'b') pg_list(pg == 'r', rid);
     else if (pg == 'l') pg_register(rid);
     else if (!sm_is_admin(rid)) pg_denied(rid);
     else switch (pg) {
-      case 'a': pg_hub(); break;
+      case 'a': pg_hub(rid, link_id); break;
       case 's': pg_settings(); break;
       case 'c': pg_access(); break;
       case 'd': pg_device(); break;
@@ -1188,11 +2092,18 @@ RNS::Bytes sm_serve(const RNS::Bytes& path_b, const RNS::Bytes& data, const RNS:
       case 'p': pg_password(rid); break;
       case 'j': pg_changes(); break;
       case 'e': pg_health(); break;
+      case 'v': pg_visitors(); break;
       case 'i': pg_lights_bt(rid); break;
       case 'o': pg_logs(); break;
       case 'x': pg_maint(rid); break;
       case 'm': pg_update(rid); break;
       case 'u': pg_about(); break;
+#ifdef HAS_ENV_SENSORS
+      case 't': pg_telemetry(); break;
+#endif
+#ifdef SM_HISTORY
+      case 'z': pg_history(); break;
+#endif
       default: Ph("Not found"); PL("Home", 'I');
     }
   }
@@ -1204,8 +2115,8 @@ RNS::Bytes sm_serve(const RNS::Bytes& path_b, const RNS::Bytes& data, const RNS:
   return RNS::Bytes(packer.data(), packer.size());
 }
 
-static const char SM_PAGE_IDS[] = "rblascdnhgfwykqpjeioxmu";
-static const char* SM_API_PATHS[] = {"/api", "/api/bat", "/api/up", "/api/radio", "/api/net", "/api/sys", "/api/health", "/api/pos", "/api/all", "/api/paths", "/api/nbrs"};
+static const char SM_PAGE_IDS[] = "rblascdnhgfwykqpjeioxmuv" SM_IDS_ENV SM_IDS_HIST;
+static const char* SM_API_PATHS[] = {"/api", "/api/bat", "/api/up", "/api/radio", "/api/net", "/api/sys", "/api/health", "/api/pos", "/api/all", "/api/paths", "/api/nbrs", "/api/links" SM_API_ENV SM_API_HIST};
 
 void sm_register(RNS::Destination& dest) {
   dest.register_request_handler("/page/index.mu", sm_serve, RNS::Type::Destination::ALLOW_ALL);
@@ -1215,21 +2126,111 @@ void sm_register(RNS::Destination& dest) {
   sm_disc = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "discovery.interface");
   sm_disc_due = millis() + 5UL * 60000UL;          // first rmap.world announce 5 min after start
   sm_nn_due = millis() + sm_ann_ms();              // the start-up announce already went out
+#ifdef SM_LXMF
+  sm_lxmf = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "lxmf", "delivery");
+  sm_lxmf.set_packet_callback(sm_lxmf_rx);
+  sm_lxmf.set_link_established_callback(sm_lxmf_link);   // "direct" delivery
+  sm_lxmf.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);   // the sender sees "delivered"
+  sm_keys_load();
+  sm_lxmf_ann_due = millis() + 60000UL;
+  NOTICEF("[lxmf] alerts from %s", sm_lxmf.hash().toHex().c_str());
+#endif
   NOTICEF("[scotmesh] %u pages/API paths registered, fw %s", (unsigned)(sizeof(SM_PAGE_IDS) + sizeof(SM_API_PATHS) / sizeof(SM_API_PATHS[0])), SCOTMESH_FW_TAG);
 }
 
 // Early boot: settings, start counter, reset reason.
 void sm_boot() {
-  sm_load(); sm.reboots++; sm_save();
+  sm_load(); sm.reboots++; sm_save(); sm_loc_load();
+#ifdef SM_BAT_CAL
+  sm_cal_load();
+#endif
+#ifdef SM_LXMF
+  sm_wall_boot();
+#endif
 #if MCU_VARIANT == MCU_NRF52
   uint32_t rr = readResetReason();
   sm_reset_reason = rr == 0 ? "power-on" : (rr & POWER_RESETREAS_DOG_Msk) ? "watchdog" : (rr & POWER_RESETREAS_SREQ_Msk) ? "soft-reset" : (rr & POWER_RESETREAS_LOCKUP_Msk) ? "lockup" : (rr & POWER_RESETREAS_RESETPIN_Msk) ? "reset-pin" : (rr & POWER_RESETREAS_OFF_Msk) ? "wake" : "other";
+  { RNS::Bytes b; if (RNS::Utilities::OS::file_exists(SM_TXF_PATH) && RNS::Utilities::OS::read_file(SM_TXF_PATH, b) == sizeof(sm_txfails)) memcpy(&sm_txfails, b.data(), sizeof(sm_txfails)); }
+  if (sm_txfail_boot) {   // the soft reset was tx_fail_reset(): say so, and count it
+    sm_reset_reason = "tx-fail"; sm_txfails++;
+    RNS::Utilities::OS::write_file(SM_TXF_PATH, RNS::Bytes((const uint8_t*)&sm_txfails, sizeof(sm_txfails)));
+  }
 #elif MCU_VARIANT == MCU_ESP32
   switch (esp_reset_reason()) {
     case ESP_RST_POWERON: sm_reset_reason = "power-on"; break; case ESP_RST_SW: sm_reset_reason = "soft-reset"; break; case ESP_RST_PANIC: sm_reset_reason = "panic"; break;
     case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: sm_reset_reason = "watchdog"; break; case ESP_RST_BROWNOUT: sm_reset_reason = "brown-out"; break; default: sm_reset_reason = "other";
   }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Stale-link watchdog -- microReticulum's own Link::start_watchdog() is an
+// unimplemented stub upstream (confirmed in both this env's git-pinned fork
+// and RTNode-HeltecV4's vendored copy -- see TODO.md), so nothing ever
+// expires an inactive Link. Every NomadNet request opens one; a client that
+// never sends LINKCLOSE (closed app, out of RF range, crash) leaves it
+// allocated forever -- confirmed cause of live memory growth on the techinc
+// repeater. Implemented here rather than patching the library, since this
+// env fetches it fresh via git on every dependency refresh (platformio.ini)
+// -- everything needed is already public API.
+//
+// Same rules as Python RNS's per-link watchdog thread, run from this loop
+// instead (a thread per link would cost a stack each):
+//  - PENDING/HANDSHAKE past its establishment_timeout (Link::validate_request
+//    sets it per hop for incoming links) is a handshake that never finished --
+//    incoming links sit in active_links, not pending_links, while handshaking;
+//  - an established link that has received nothing for STALE_TIME +
+//    STALE_GRACE (725 s) is dead. Live NomadNet/MeshChat clients send a
+//    keepalive every KEEPALIVE (360 s), which updates last_inbound, so they
+//    never get near it. no_inbound_for(), not inactive_for(): the latter is a
+//    min() with our own sends, so a peer we keep sending to after it has gone
+//    would look alive.
+// teardown() closes any non-CLOSED link (LINKCLOSE unless PENDING); Transport's
+// own sweep then drops it from active_links. teardown()/status(set) aren't
+// const methods, and std::set elements are always const on iteration (an STL
+// ordering-invariant rule, not a microReticulum one), so each Link is copied
+// out via its copy constructor to get a mutable handle -- still the same
+// underlying shared object.
+// ---------------------------------------------------------------------------
+static bool sm_link_handshaking(const RNS::Link& link) {
+  return link.status() == RNS::Type::Link::PENDING || link.status() == RNS::Type::Link::HANDSHAKE;
+}
+
+static void sm_links_watchdog() {
+  double now = RNS::Utilities::OS::time();
+  for (const auto& ref : RNS::Transport::active_links()) {
+    RNS::Link link = ref;
+    if (link.status() == RNS::Type::Link::CLOSED) continue;   // Transport's own sweep reaps it
+    if (sm_link_handshaking(link)) {
+      double age = link.request_time() > 0 ? now - link.request_time() : link.no_inbound_for();
+      if (age > std::max(link.establishment_timeout(), 30.0)) { link.teardown(); ++sm_links_closed_stuck; }
+    }
+    else if (link.no_inbound_for() > RNS::Type::Link::STALE_TIME + RNS::Type::Link::STALE_GRACE) { link.teardown(); ++sm_links_closed_idle; }
+  }
+
+  // Memory-pressure guard: regardless of idle time, keep closing one link
+  // while the TLSF link pool is critically low (see J_ram()/free_pool -- the
+  // pool itself, not the general system heap). Victim: unfinished handshakes
+  // first (most likely dead), then whichever link has heard nothing for
+  // longest -- not the oldest-opened, which may be a long session in use.
+  // Only on builds whose Reticulum containers live in that pool (nRF52, e.g.
+  // the P1): on ESP32 builds using PSRAM or the plain heap the pool is never
+  // created, heap_pool_free() reads 0, and this would close every link on
+  // every pass.
+  if (RNS::Utilities::Memory::heap_pool_size() == 0) return;
+  while (RNS::Utilities::Memory::heap_pool_free() < SM_MIN_POOL_FREE) {
+    RNS::Link victim; bool found = false, victim_hs = false; double victim_idle = 0;
+    for (const auto& ref : RNS::Transport::active_links()) {
+      RNS::Link link = ref;
+      if (link.status() == RNS::Type::Link::CLOSED) continue;
+      bool hs = sm_link_handshaking(link); double idle = link.no_inbound_for();
+      if (!found || (hs && !victim_hs) || (hs == victim_hs && idle > victim_idle)) { victim = link; victim_hs = hs; victim_idle = idle; found = true; }
+    }
+    if (!found) break;  // nothing left to close -- pressure isn't coming from links
+    NOTICEF("[links] pool low (%u bytes free), closing %s link idle %us", (unsigned)RNS::Utilities::Memory::heap_pool_free(),
+      victim_hs ? "unfinished" : "least recently heard", (unsigned)victim_idle);
+    victim.teardown(); ++sm_links_closed_mem;
+  }
 }
 
 // Called every loop pass.
@@ -1260,15 +2261,29 @@ void sm_loop() {
   static uint32_t last_pwr = 0;
   if (now - last_pwr > 60000UL && battery_voltage > 0.1) {
     last_pwr = now;
-    bool low = !sm_charging() && battery_percent < sm.pwr_below, recovered = sm_charging() || battery_percent >= sm.pwr_below + 10;
-    bool undervolt = sm.pwr_lock && !sm_charging() && battery_voltage < 3.3, voltok = battery_voltage >= 3.5 || sm_charging();
+    // Battery level only, never "charging": boards without a charge-status
+    // pin guess it from the voltage trend, and a big pack that barely moves
+    // at night reads "charging" in the dark -- which kept every action here
+    // from firing. A low battery that is really charging just stays in the
+    // reduced state until it's back above the threshold + 10 %.
+    bool low = battery_percent < sm.pwr_below, recovered = battery_percent >= sm.pwr_below + 10;
+    bool undervolt = sm.pwr_lock && battery_voltage < 3.3, voltok = battery_voltage >= 3.5;
     if ((low && sm.pwr_act == 2) || undervolt) { if (!sm_power_sleep) { sm_power_sleep = true; stopRadio(); NOTICE("[power] low battery, radio off"); } }
     else if (sm_power_sleep && recovered && voltok) { sm_power_sleep = false; startRadio(); NOTICE("[power] battery recovered, radio on"); }
     if (low && sm.pwr_act == 1 && !sm_power_limited && lora_txp > 10) { sm_saved_txp = lora_txp; lora_txp = 10; setTXPower(); sm_power_limited = true; NOTICE("[power] low battery, TX power lowered"); }
     else if (sm_power_limited && recovered) { lora_txp = sm_saved_txp; setTXPower(); sm_power_limited = false; NOTICE("[power] battery recovered, TX power restored"); }
   }
+  // stale-link watchdog, every 30s -- cheap against a 725s (STALE_TIME + STALE_GRACE) threshold
+  static uint32_t last_links_check = 0;
+  if (now - last_links_check > 30000UL) { last_links_check = now; sm_links_watchdog(); }
+#ifdef SM_HISTORY
+  sm_hist_loop(now);
+#endif
+#ifdef SM_LXMF
+  sm_lxmf_loop(now, up);
+#endif
   // announces
   if (sm.map_on && sm_disc && !sm_disc_busy && sm_disc_due && (int32_t)(now - sm_disc_due) >= 0) { sm_disc_due = now + sm_ann_ms(); sm_disc_start(); }
-  if (sm_nn_due && (int32_t)(now - sm_nn_due) >= 0 && nomadnet_destination) { sm_nn_due = now + sm_ann_ms(); nomadnet_destination.announce(RNS::Bytes(nomadnet_name)); NOTICE("[nomadnet] periodic announce"); }
+  if (sm_nn_due && (int32_t)(now - sm_nn_due) >= 0 && nomadnet_destination) { sm_nn_due = now + sm_ann_ms(); sm_announce(); NOTICE("[nomadnet] periodic announce"); }
   sm_disc_work();
 }

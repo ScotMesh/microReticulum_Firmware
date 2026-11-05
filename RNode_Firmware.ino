@@ -33,6 +33,9 @@
 #ifdef HAS_BME
 #include "BME680.h"
 #endif
+#ifdef HAS_ENV_SENSORS
+#include "EnvSensors.h"
+#endif
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -43,6 +46,7 @@
 // ScotMesh: consulted by the LED helpers and the nRF52 Bluetooth start code
 bool sm_leds_off = false;
 bool sm_dfu_window = false;
+bool sm_txfail_boot = false;   // this boot follows a restart after a failed transmit (SM_TXFAIL_MAGIC)
 #include "Utilities.h"
 #include "DeviceUID.h"
 #include "Platform.h"
@@ -253,10 +257,11 @@ RNS::Interface udp_interface(RNS::Type::NONE);
 // CBA logger callback
 #if defined(URTN_STATS_PAGES) && !defined(SCOTMESH_NO_PAGES)
 void sm_log_line(const char* msg);
+void sm_link_seen(const RNS::Bytes& raw, const RNS::Interface& interface);
 #endif
 void on_log(const char* msg, RNS::LogLevel level) {
 #if defined(URTN_STATS_PAGES) && !defined(SCOTMESH_NO_PAGES)
-  sm_log_line(msg);
+  if (level <= RNS::LOG_NOTICE) sm_log_line(msg);   // the Logs page keeps 5 lines: trace chatter would push them out at once
 #endif
   if (kiss_framed_logs) {
     // Compose "<timestamp> [<level>] <msg>" into a stack buffer to avoid
@@ -291,6 +296,9 @@ void on_log(const char* msg, RNS::LogLevel level) {
 
 // CBA receive packet callback
 void on_receive_packet(const RNS::Bytes& raw, const RNS::Interface& interface) {
+#if defined(URTN_STATS_PAGES) && !defined(SCOTMESH_NO_PAGES)
+  sm_link_seen(raw, interface);   // hops + signal per link, for the home page's "Your link" line
+#endif
 #ifdef HAS_SDCARD
   TRACE("Logging receive packet to SD");
   String line = RNS::getTimeString() + String(" recv: ") + String(raw.toHex().c_str()) + "\n";
@@ -483,14 +491,20 @@ void dump_filesystem(const char* basepath, uint8_t level = 0, uint8_t max_level 
   #include "ScotMesh.h"
 #endif
 
-#if MCU_VARIANT == MCU_NRF52
+// Needs the .noinit section only the P1's linker script (nrf52840_s140_v7.ld) provides
+#if BOARD_MODEL == BOARD_SEEED_P1
   #include "FaultDump.h"
 #endif
 
 void setup() {
 
+  #if defined(RTNODE_CPU_MHZ) && MCU_VARIANT == MCU_ESP32
+    setCpuFrequencyMhz(RTNODE_CPU_MHZ);
+  #endif
+
   #if MCU_VARIANT == MCU_NRF52 && defined(URTN_STATS_PAGES) && !defined(SCOTMESH_NO_PAGES)
     sm_dfu_window = (NRF_POWER->GPREGRET2 == SM_DFU_MAGIC);
+    sm_txfail_boot = (NRF_POWER->GPREGRET2 == SM_TXFAIL_MAGIC);
     NRF_POWER->GPREGRET2 = 0;
   #endif
 
@@ -499,6 +513,10 @@ void setup() {
   fifo_init(&serialFIFO, serialBuffer, CONFIG_UART_BUFFER_SIZE);
 
   Serial.begin(serial_baudrate);
+
+  #if defined(RTNODE_CPU_MHZ) && MCU_VARIANT == MCU_ESP32
+    Serial.printf("[power] CPU clock %u MHz\r\n", (unsigned)getCpuFrequencyMhz());
+  #endif
 
   // Redirect stdout to KISS framed logs
   install_kiss_stdout();
@@ -544,6 +562,10 @@ void setup() {
 
 #ifdef HAS_BME
   BME680::init();
+#endif
+
+#ifdef HAS_ENV_SENSORS
+  EnvSensors::init();
 #endif
 
   // Configure WDT
@@ -753,6 +775,15 @@ void setup() {
       delay(100);
     #endif
 
+    #if BOARD_MODEL == BOARD_SEEED_P1
+      // The P1 bootloader (0.9.2-OTAFIX2.2-BP1.3) can leave the SX1262 in reset
+      // or undefined after boot: without this pulse preInit() reads no sync word,
+      // "No radio module found", hw_ready 0, and the TNC config is never loaded.
+      delay(10);
+      LoRa->reset();
+      delay(10);
+    #endif
+
     // Check installed transceiver chip and
     // probe boot parameters.
     #if MCU_VARIANT == MCU_NATIVE
@@ -878,7 +909,9 @@ void setup() {
                (rr & POWER_RESETREAS_OFF_Msk)      ? " wake-from-system-off" : "",
                (rr & POWER_RESETREAS_VBUS_Msk)     ? " vbus-wake" : "");
         if (rr == 0) printf("[init] reset reason: power-on or brown-out\n");
-        fault_dump_print();
+        #if BOARD_MODEL == BOARD_SEEED_P1
+          fault_dump_print();
+        #endif
         printf("[init] usb power %s\n", usb_present ? "present" : "absent (battery)");
       }
     #endif
@@ -1790,6 +1823,18 @@ void update_airtime() {
   #endif
 }
 
+// A transmit the radio never finished restarts the node. On ScotMesh nRF52
+// builds, leave a marker in GPREGRET2 first (it survives the reset), so the
+// next boot reports "tx-fail" instead of a plain soft reset: on Health,
+// /api/sys and in the LXMF restart alert, with a running count.
+static void tx_fail_reset() {
+  #if MCU_VARIANT == MCU_NRF52 && defined(SM_TXFAIL_MAGIC)
+    uint8_t sd = 0; sd_softdevice_is_enabled(&sd);
+    if (sd) { sd_power_gpregret_clr(1, 0xFF); sd_power_gpregret_set(1, SM_TXFAIL_MAGIC); } else NRF_POWER->GPREGRET2 = SM_TXFAIL_MAGIC;
+  #endif
+  hard_reset();
+}
+
 void transmit(uint16_t size) {
   if (radio_online) {
     if (!promisc) {
@@ -1812,11 +1857,22 @@ void transmit(uint16_t size) {
               if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
               else { LoRa->receive(); return; }
             #else
-              hard_reset();
+              tx_fail_reset();
             #endif
           }
 
           add_airtime(written);
+          // A receiver needs real turnaround time between frames -- its own
+          // hardware IRQ has to fire, get polled, get parsed, and only then
+          // does it re-arm RX. With back-to-back beginPacket() calls here
+          // (no gap at all), frame 2's preamble can start before the
+          // receiver is listening again, and a missed preamble means the
+          // whole frame is lost, not just delayed -- confirmed as the cause
+          // of a reply never completing reassembly on a real receiver
+          // (ratspeak-handheld D1L), 100% reproducible despite strong
+          // signal, every time. Paced here rather than relying on every
+          // possible receiver being fast enough.
+          delay(20);
           LoRa->beginPacket();
           LoRa->write(header);
           written = 1;
@@ -1832,7 +1888,7 @@ void transmit(uint16_t size) {
           if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
           else { LoRa->receive(); return; }
         #else
-          hard_reset();
+          tx_fail_reset();
         #endif
       }
 
@@ -2923,10 +2979,21 @@ void loop() {
 
   #if HAS_INPUT
     input_read();
+    #if BOARD_MODEL == BOARD_HELTEC32_V4
+      v4_button_poll();
+    #endif
   #endif
 
 #ifdef SCOTMESH_PAGES
-  sm_loop();
+  try {
+    sm_loop();
+  }
+  catch (const std::bad_alloc&) {
+    ERROR("sm_loop failed: bad_alloc - out of memory");
+  }
+  catch (std::exception& e) {
+    ERRORF("sm_loop failed: %s", e.what());
+  }
 #endif
 
   // Feed WDT
@@ -2947,6 +3014,13 @@ void loop() {
       kiss_indicate_error(ERROR_MEMORY_LOW); memory_low = false;
     #endif
   }
+
+  #if defined(RTNODE_LOOP_SLEEP_MS) && MCU_VARIANT == MCU_ESP32
+    // Block for a tick instead of spinning: the idle task then clock-gates the
+    // CPU (WAITI) between passes. Received packets are read out by the radio ISR
+    // as they arrive, so a 1 ms pause only delays their processing by <=1 ms.
+    vTaskDelay(pdMS_TO_TICKS(RTNODE_LOOP_SLEEP_MS));
+  #endif
 }
 
 void sleep_now() {
@@ -3003,6 +3077,98 @@ void sleep_now() {
   #endif
 }
 
+#if BOARD_MODEL == BOARD_HELTEC32_V4
+// Heltec V4 is typically a roof-mounted, physically unattended repeater, so the
+// shared button scheme's hold-to-deep-sleep (old 700-5000ms tier, sleep_now())
+// is dropped here: an accidental/vibration-triggered hold up there would need
+// someone to climb up and power-cycle it to recover. Short-click Bluetooth
+// toggle/pairing was already dead on this board anyway (HAS_BLUETOOTH is
+// false for BOARD_HELTEC32_V4 -- see Boards.h), so repurposing that range
+// costs nothing. The >10000ms serial-console escape hatch is kept as-is
+// (HAS_CONSOLE is true here and it's a genuinely useful recovery path).
+//
+// New scheme while the screen is already on:
+//   < 700ms (single click)  -> deferred: toggle the display, UNLESS a second
+//                              click arrives within the window below (then
+//                              it's a double click instead)
+//   < 700ms (double click)  -> send one announce right now
+//   700-10000ms (hold)      -> send a burst of 5 announces, 2s apart
+// Screen already blanked: any press (any duration) just wakes it, same as
+// every other board's shared path.
+#define V4_DOUBLE_CLICK_WINDOW_MS 400
+#define V4_BURST_INTERVAL_MS 2000
+#define V4_BURST_COUNT 5
+static bool v4_click_pending = false;
+static unsigned long v4_click_release_at = 0;
+static uint8_t v4_burst_remaining = 0;
+static unsigned long v4_burst_next_at = 0;
+
+static void v4_send_announce_now() {
+  #ifdef URTN_STATS_PAGES
+    if (nomadnet_enabled && nomadnet_destination) {
+      nomadnet_destination.announce(RNS::Bytes(nomadnet_name));
+      NOTICE("[button] manual announce sent");
+    }
+  #endif
+}
+
+static void v4_toggle_display() {
+  if (display_blanked) {
+    display_unblank();
+  } else {
+    // Backdating last_unblank_event (rather than a separate forced-blank
+    // flag) makes the very next update_display() tick blank on its own,
+    // through the exact same path the idle timeout already uses. Only takes
+    // effect while display blanking is enabled in provisioning -- a known,
+    // accepted gap for the rare case it's been turned off there.
+    last_unblank_event = millis() - display_blanking_timeout - 1;
+    display_blanked = true;
+    update_display(true);
+  }
+}
+
+void button_event(uint8_t event, unsigned long duration) {
+  if (display_blanked) { display_unblank(); return; }
+  if (duration > 10000) {
+    #if HAS_CONSOLE
+      console_active = true;
+      console_start();
+    #endif
+    return;
+  }
+  if (duration >= 700) {
+    v4_click_pending = false; // a hold is never part of a click pair
+    v4_burst_remaining = V4_BURST_COUNT;
+    v4_burst_next_at = millis(); // first one fires on the very next poll tick
+    return;
+  }
+  if (v4_click_pending && millis() - v4_click_release_at < V4_DOUBLE_CLICK_WINDOW_MS) {
+    v4_click_pending = false;
+    v4_send_announce_now();
+  } else {
+    v4_click_pending = true;
+    v4_click_release_at = millis();
+  }
+}
+
+// Called once per loop() iteration: resolves a deferred single click once the
+// double-click window has passed without a second click, and pumps the
+// announce burst without blocking the radio/watchdog loop (same non-blocking
+// due-timestamp convention sm_loop() already uses for its own periodic
+// announce in ScotMesh.h).
+void v4_button_poll() {
+  unsigned long now = millis();
+  if (v4_click_pending && now - v4_click_release_at >= V4_DOUBLE_CLICK_WINDOW_MS) {
+    v4_click_pending = false;
+    v4_toggle_display();
+  }
+  if (v4_burst_remaining && (int32_t)(now - v4_burst_next_at) >= 0) {
+    v4_send_announce_now();
+    v4_burst_remaining--;
+    v4_burst_next_at = now + V4_BURST_INTERVAL_MS;
+  }
+}
+#else
 void button_event(uint8_t event, unsigned long duration) {
   #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_NATIVE
     if (display_blanked) {
@@ -3040,6 +3206,7 @@ void button_event(uint8_t event, unsigned long duration) {
     }
   #endif
 }
+#endif
 
 volatile bool serial_polling = false;
 void serial_poll() {
