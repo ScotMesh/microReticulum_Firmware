@@ -4,6 +4,7 @@
 
 ### Added
 
+- Routes page shows names: each route is named by its destination's own announced name (LXMF or NomadNet, multi-hop routes too), the way the Visitors page already does. It used to look names up in the neighbour list, which is keyed by next hop, so almost no route got a name. Named rows take more bytes, so fewer rows fit per page; the rest stays under "next".
 - Solar Node P1: the undocumented SX1262 receive-sensitivity patch (bit 0 of register 0x08B5) recommended by Heltec/Semtech, as Meshtastic runs it on the P1 together with boosted gain. A build flag (`SX126X_RX_PATCH`), on for the P1 only; MeshCore enables it only on boards with an RF front end.
 - Grove-port sensor support on the Solar Node P1: SHT4x, SHTC3, AHT10/20, BME280, BME680, BMP180, M5 ENV I/II/III, and INA219/INA226/INA260/INA3221 power monitors, plus the nRF52840's own die temperature — all on the Telemetry page and `/api/env`.
 - 7-day telemetry history (battery, sensors, mesh) with a History page and `/api/hist` endpoint.

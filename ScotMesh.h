@@ -1026,18 +1026,21 @@ static void pg_home(const RNS::Bytes& rid, const RNS::Bytes& link_id) {
 
 // Routes (path table) and neighbours: rows until the row count or the byte budget runs out.
 struct SmListCtx { bool shrt; int o, n, seen, rows; bool more; double now; size_t limit; };
-// Only names routes whose destination is also a cached direct neighbour (see
-// SmAnnounceWatch above) -- multi-hop destinations never had their app_data
-// captured, so they still fall back to the bare hash.
+// A neighbour's cached plain-text name, by next-hop id (see SmAnnounceWatch).
 static const char* sm_nbr_name(const RNS::Bytes& id) {
   for (auto& n : sm_nbrs) if (n.id == id) return n.name;
   return nullptr;
 }
+static const char* sm_dest_name(const RNS::Bytes& d, char* buf);   // below, with the Visitors names
 static bool sm_route_row(const RNS::Bytes& k, uint8_t hops, double heard, const RNS::Bytes&, void* vc) {
   SmListCtx& c = *(SmListCtx*)vc;
   if (c.seen++ < c.o) return true;
   if (c.rows >= c.n) { c.more = true; return false; }
-  char age[8]; const char* name = sm_nbr_name(k);
+  // Named by the destination's own announced name (LXMF or NomadNet, also for
+  // multi-hop routes -- the library stores app_data for every destination it
+  // validates an announce for); the neighbour cache is keyed by next hop, so
+  // it almost never matched a route.
+  char age[8], nb[17]; const char* name = sm_dest_name(k, nb);
   std::string h = k.toHex(); if (c.shrt) h.resize(8);
   size_t before = sm_pn;
   P("%-*s %4u %5s", c.shrt ? 8 : 32, h.c_str(), hops, sm_age(c.now - heard, age));   // padded to the header row's columns
