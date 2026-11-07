@@ -37,6 +37,7 @@
 #if defined(SCOTMESH_WIFI_UPDATE)      // ESP32 boards with two app slots (platformio.ini)
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Update.h>
 #include <esp_ota_ops.h>
 #include <esp_task_wdt.h>
@@ -488,19 +489,59 @@ void sm_early_boot() {
 #endif
 }
 #if defined(SCOTMESH_WIFI_UPDATE)
-// Boot straight into a WiFi access point with an upload page, no mesh, for
-// 20 min; restarts when done.
+// Optional WiFi network for the update window, in its own file (like the
+// battery calibration): the window joins it as a client first, so a node on
+// a roof can be updated through the building's WiFi from anywhere inside;
+// not connected within 30 s -> its own access point, as before.
+static const char* SM_WIFI_PATH = "/scotmesh.wifi";
+struct SmWifi { char ssid[33]; char psk[65]; };
+static bool sm_wifi_load(SmWifi& w) {
+  memset(&w, 0, sizeof w); RNS::Bytes b;
+  if (!RNS::Utilities::OS::file_exists(SM_WIFI_PATH) || RNS::Utilities::OS::read_file(SM_WIFI_PATH, b) != sizeof w) return false;
+  memcpy(&w, b.data(), sizeof w); w.ssid[32] = 0; w.psk[64] = 0;
+  return w.ssid[0] != 0;
+}
+// mDNS name for the window in client mode, from the chip's own MAC: the same
+// before the restart (shown on the page) and in the window.
+static const char* sm_wifi_host() {
+  static char h[20]; uint64_t m = ESP.getEfuseMac();
+  snprintf(h, sizeof h, "scotmesh-%02x%02x", (unsigned)((m >> 32) & 0xFF), (unsigned)((m >> 40) & 0xFF));
+  return h;
+}
+// Boot straight into the WiFi update window with an upload page, no mesh, for
+// 20 min: joins the configured network if it can, else its own access point.
+// Restarts when done.
 void sm_update_mode() {
   sm_load();
   if (!sm.upd_wifi) return;
   char pw[9]; memcpy(pw, sm.upd_pw, 9); pw[8] = 0;
   sm.upd_wifi = 0; memset(sm.upd_pw, 0, sizeof sm.upd_pw); sm_save();       // one boot only, even if this one crashes
-  printf("[update] WiFi update window: SSID ScotMesh-Update, http://" SM_UPDATE_IP ", 20 min\n");
-  // 10.73.73.1 rather than the ESP32 default 192.168.4.1, which home networks
-  // often use too (a laptop on both cannot reach the node). 73: "best regards".
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(IPAddress(10, 73, 73, 1), IPAddress(10, 73, 73, 1), IPAddress(255, 255, 255, 0));
-  WiFi.softAP("ScotMesh-Update", pw); delay(200);
+  // Client mode first, if a network is configured. On a shared network the
+  // page is reachable by everyone on it, so it then asks for a login (user
+  // "admin", the one-time password).
+  static bool sta = false; SmWifi wf;
+  if (sm_wifi_load(wf)) {
+    printf("[update] joining WiFi %s as %s.local\n", wf.ssid, sm_wifi_host());
+    WiFi.mode(WIFI_STA); WiFi.setHostname(sm_wifi_host());
+    WiFi.begin(wf.ssid, wf.psk[0] ? wf.psk : nullptr);
+    uint32_t tj = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - tj < 30000) { esp_task_wdt_reset(); delay(100); }
+    sta = WiFi.status() == WL_CONNECTED;
+    if (sta) {
+      if (MDNS.begin(sm_wifi_host())) MDNS.addService("http", "tcp", 80);
+      printf("[update] WiFi update window: http://%s.local or http://%s (login admin / %s), 20 min\n", sm_wifi_host(), WiFi.localIP().toString().c_str(), pw);
+    } else { printf("[update] could not join %s, falling back to the access point\n", wf.ssid); WiFi.disconnect(true); delay(200); }
+  }
+  memset(&wf, 0, sizeof wf);
+  if (!sta) {
+    printf("[update] WiFi update window: SSID ScotMesh-Update, http://" SM_UPDATE_IP ", 20 min\n");
+    // 10.73.73.1 rather than the ESP32 default 192.168.4.1, which home networks
+    // often use too (a laptop on both cannot reach the node). 73: "best regards".
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(IPAddress(10, 73, 73, 1), IPAddress(10, 73, 73, 1), IPAddress(255, 255, 255, 0));
+    WiFi.softAP("ScotMesh-Update", pw); delay(200);
+  }
+  static char upw[9]; memcpy(upw, pw, 9);
   static WebServer srv(80); static bool done = false, failed = false; static size_t got = 0;
   static const char* page =
     "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'><title>ScotMesh node update</title>"
@@ -517,14 +558,19 @@ void sm_update_mode() {
     "x.onload=function(){if(x.status==200)document.body.innerHTML=x.responseText;else t.textContent=x.responseText;};"
     "x.onerror=function(){t.textContent='Connection lost. If your computer left the ScotMesh-Update WiFi, rejoin it and reload this page.';b.disabled=false;};"
     "x.send(new FormData(f));b.disabled=true;p.hidden=false;t.textContent='Starting upload...';};</script>";
-  srv.on("/", HTTP_GET, []() { srv.send(200, "text/html; charset=utf-8", page); });
+  srv.on("/", HTTP_GET, []() {
+    if (sta && !srv.authenticate("admin", upw)) return srv.requestAuthentication();
+    srv.send(200, "text/html; charset=utf-8", page);
+  });
   srv.on("/update", HTTP_POST, []() {
+    if (sta && !srv.authenticate("admin", upw)) return srv.requestAuthentication();
     if (failed) { srv.send(500, "text/plain", "Update failed: " + String(Update.errorString()) + ". The node restarts unchanged; open a new window from its page to try again."); delay(1500); hard_reset(); }
     srv.send(200, "text/html; charset=utf-8", "<!doctype html><body style='font:16px system-ui;margin:2em'><h2>Updated.</h2><p>Written and verified; the node is restarting into the new firmware now. You can reconnect your phone to its usual WiFi.</p>");
     done = true;
   }, []() {
     HTTPUpload& up = srv.upload();
     esp_task_wdt_reset();
+    if (up.status == UPLOAD_FILE_START && sta && !srv.authenticate("admin", upw)) { failed = true; return; }   // never write an unauthenticated upload
     if (up.status == UPLOAD_FILE_START) { printf("[update] receiving %s\n", up.filename.c_str()); got = 0; if (Update.isRunning()) Update.abort(); failed = !Update.begin(UPDATE_SIZE_UNKNOWN); if (failed) printf("[update] cannot start: %s\n", Update.errorString()); }
     else if (up.status == UPLOAD_FILE_WRITE && !failed) { if (Update.write(up.buf, up.currentSize) != up.currentSize) failed = true; got += up.currentSize; }
     else if (up.status == UPLOAD_FILE_END && !failed) { failed = !Update.end(true); printf("[update] %s, %u bytes\n", failed ? Update.errorString() : "written and verified", (unsigned)got); }
@@ -758,7 +804,7 @@ static void sm_lxmf_event(const char* fmt, ...) {
   va_list a; va_start(a, fmt); vsnprintf(sm_lxmf_last, sizeof sm_lxmf_last, fmt, a); va_end(a);
   NOTICEF("[lxmf] %s", sm_lxmf_last);
 }
-static char sm_fault_note[40] = "";
+static char sm_fault_note[64] = "";
 
 // Wall clock for message times, learned from requesters (page requests and
 // incoming messages carry the sender's time). Kept apart from the stack's own
@@ -913,16 +959,18 @@ static void sm_lxmf_link_rx(const RNS::Bytes& data, const RNS::Packet&) {
 }
 static void sm_lxmf_link(RNS::Link& link) { link.set_packet_callback(sm_lxmf_link_rx); sm_lxmf_event("link opened, waiting for a message"); }
 
-void sm_note_fault(bool exception, uint32_t pc, uint32_t lr) {   // from FaultDump.h at boot
+// pc alone says where it crashed, not who called it: lr (the caller) and cfsr
+// (what kind of fault) make one alert enough to trace it with addr2line.
+void sm_note_fault(bool exception, uint32_t pc, uint32_t lr, uint32_t cfsr) {   // from FaultDump.h at boot
   if (exception) snprintf(sm_fault_note, sizeof sm_fault_note, ", uncaught exception lr=%08lx", (unsigned long)lr);
-  else snprintf(sm_fault_note, sizeof sm_fault_note, ", hard fault pc=%08lx", (unsigned long)pc);
+  else snprintf(sm_fault_note, sizeof sm_fault_note, ", hard fault pc=%08lx lr=%08lx cfsr=%08lx", (unsigned long)pc, (unsigned long)lr, (unsigned long)cfsr);
 }
 static void sm_lxmf_loop(uint32_t now, uint64_t up) {
   if (!sm_lxmf) return;
   if (sm_lxmf_ann_due && (int32_t)(now - sm_lxmf_ann_due) >= 0) { sm_lxmf_ann_due = 0; sm_lxmf_announce(); NOTICE("[lxmf] start-up announce"); }
   static bool boot_sent = false;
   if (!boot_sent && up > 120000ULL) {              // give the node 2 min to hear paths first
-    boot_sent = true; char b[160];
+    boot_sent = true; char b[192];
     snprintf(b, sizeof b, "%s is running again (%s, restart #%lu%s), battery %d%%%s", nomadnet_name, sm_reset_reason, (unsigned long)sm.reboots, sm_fault_note, sm_pct(), sm_charging() ? " charging" : "");
     sm_alert(b);
   }
@@ -1393,13 +1441,19 @@ static void pg_radio(const RNS::Bytes& rid) {
     if (!(r.f > 137000000 && r.f < 1020000000) || !bw_ok || r.sf < 5 || r.sf > 12 || r.cr < 5 || r.cr > 8 || r.txp < -9 || r.txp > 22) { msg = "Out of range. Nothing changed."; kind = 'b'; }
     else start(r);
   }
-  if (Vis("a", "p")) start(Vis("v", "433") ? SmRadio{433775000, 125000, 8, 5, 7} : SmRadio{869462500, 125000, 9, 5, 22});
+  SmRadio cur = sm_radio_now();   // shown in the fields; a preset only fills them in
+  const bool preset = Vis("a", "p");
+  if (preset) {
+    const bool p433 = Vis("v", "433"), pnl = Vis("v", "nl");
+    cur = p433 ? SmRadio{433775000, 125000, 8, 5, 7} : pnl ? SmRadio{869463000, 125000, 8, 5, 22} : SmRadio{869462500, 125000, 9, 5, 22};
+    msg = p433 ? "433 filled in. Try these to test." : pnl ? "NL filled in. Try these to test." : "868 filled in. Try these to test.";
+  }
   if (Vis("a", "k") && sm_trial) { sm_trial = false; eeprom_conf_save(); sm_change(rid, "radio kept"); msg = "Kept and saved."; }
   Ph("Radio"); Pmsg(kind, msg);
-  if (sm_trial && !msg) { P("`Fda3Trial: reverts in %lu min`f ", (unsigned long)((sm_trial_until - now) / 60000 + 1)); PL("Keep", 'f', "a=k"); P("\n"); }
-  char v[5][12]; snprintf(v[0], 12, "%.3f", lora_freq / 1e6); snprintf(v[1], 12, "%lu", (unsigned long)(lora_bw / 1000)); snprintf(v[2], 12, "%d", lora_sf); snprintf(v[3], 12, "%d", lora_cr); snprintf(v[4], 12, "%d", lora_txp);
+  if (sm_trial) { if (!msg || preset) P("`Fda3Trial: reverts in %lu min`f ", (unsigned long)((sm_trial_until - now) / 60000 + 1)); PL("Keep", 'f', "a=k"); P("\n"); }
+  char v[5][12]; snprintf(v[0], 12, "%.3f", cur.f / 1e6); snprintf(v[1], 12, "%lu", (unsigned long)(cur.bw / 1000)); snprintf(v[2], 12, "%d", cur.sf); snprintf(v[3], 12, "%d", cur.cr); snprintf(v[4], 12, "%d", cur.txp);
   P("MHz "); PF(8, "fq", v[0]); P(" kHz "); PF(3, "bw", v[1]); P("\nSF "); PF(2, "sf", v[2]); P(" CR "); PF(1, "cr", v[3]); P(" dBm "); PF(2, "tx", v[4]); P("\n");
-  PL("Try these", 'f', "fq|bw|sf|cr|tx|a=t"); P("\n" DIM("Preset:") " "); PL("ScotMesh 868", 'f', "a=p|v=868"); P(" "); PL("433", 'f', "a=p|v=433"); P("\n"); PBACK('s');
+  PL("Try these", 'f', "fq|bw|sf|cr|tx|a=t"); P("\n" DIM("Preset:") " "); PL("ScotMesh 868", 'f', "a=p|v=868"); P(" "); PL("433", 'f', "a=p|v=433"); P(" "); PL("NL", 'f', "a=p|v=nl"); P("\n"); PBACK('s');
 }
 
 static void pg_role(const RNS::Bytes& rid) {
@@ -1590,7 +1644,11 @@ static void pg_update(const RNS::Bytes& rid) {
   bool power_ok = battery_percent >= 30 || sm_charging() || battery_voltage < 0.1;
   if (!strcmp(a, "cw") && sm_has_ota_slot()) {
     if (!power_ok) { Ph("Firmware update"); Pmsg('b', "Battery low and not charging."); P(DIM("Needs 30%% or a charger.") "\n"); PL("Back", 'm'); return; }
-    Ph("WiFi update window?"); P("Restarts as a WiFi access point for\n20 min, off the mesh. Someone in range\nuploads the .bin from the release zip\nat http://" SM_UPDATE_IP "\n`Fda3Someone must be within WiFi range.`f\n\n");
+    SmWifi wf; bool net = sm_wifi_load(wf);
+    Ph("WiFi update window?");
+    if (net) P("Restarts off the mesh for 20 min and\njoins WiFi %s; if it can't\n(30 s), opens its own access point.\nUpload the .bin from the release zip.\n\n", wf.ssid);
+    else P("Restarts as a WiFi access point for\n20 min, off the mesh. Someone in range\nuploads the .bin from the release zip\nat http://" SM_UPDATE_IP "\n`Fda3Someone must be within WiFi range.`f\n\n");
+    memset(&wf, 0, sizeof wf);
     PLf("Yes, start", 'm', "a=dw|k=%s", sm_token("cw")); P("\n" DIM("This link works once, for 2 min.")); return;
   }
   if (!strcmp(a, "dw") && sm_has_ota_slot()) {
@@ -1599,9 +1657,34 @@ static void pg_update(const RNS::Bytes& rid) {
       RNS::Bytes r = RNS::Cryptography::random(8);
       for (int i = 0; i < 8; i++) sm.upd_pw[i] = "abcdefghjkmnpqrstuvwxyz23456789"[r.data()[i] % 31];
       sm.upd_pw[8] = 0; sm.upd_wifi = 1; sm_save(); sm_change(rid, "WiFi update window");
-      P("#!c=0\n`F2c5Update window opens in a few seconds.`f\nWiFi: ScotMesh-Update\nPassword: %s\nThen open http://" SM_UPDATE_IP "\n" DIM("Write the password down: it is shown once."), sm.upd_pw);
+      SmWifi wf; bool net = sm_wifi_load(wf);
+      P("#!c=0\n`F2c5Update window opens in a few seconds.`f\n");
+      if (net) P("On %s: http://%s.local\nLogin admin / %s\n" DIM("Else WiFi ScotMesh-Update, same password,") "\n" DIM("http://" SM_UPDATE_IP) "\n", wf.ssid, sm_wifi_host(), sm.upd_pw);
+      else P("WiFi: ScotMesh-Update\nPassword: %s\nThen open http://" SM_UPDATE_IP "\n", sm.upd_pw);
+      P(DIM("Write the password down: it is shown once."));
+      memset(&wf, 0, sizeof wf);
       sm_dfu_action = 1; sm_dfu_action_at = millis(); return;
     }
+  }
+  // WiFi network for the update window (client mode first, see sm_update_mode)
+  if (!strcmp(a, "ws")) {
+    const char* ss = Fv("ws"); const char* pk = Fv("wp");
+    if (!*ss) msg = "Network name is empty.";
+    else if (strlen(ss) > 32 || strlen(pk) > 63) msg = "Name max 32, password max 63.";
+    else {
+      SmWifi wf; memset(&wf, 0, sizeof wf); strncpy(wf.ssid, ss, 32); strncpy(wf.psk, pk, 64);
+      RNS::Utilities::OS::write_file(SM_WIFI_PATH, RNS::Bytes((const uint8_t*)&wf, sizeof wf)); memset(&wf, 0, sizeof wf);
+      sm_change(rid, "update WiFi network"); msg = nullptr; Ph("WiFi network"); Pmsg('o', "Saved."); PL("Back", 'm'); return;
+    }
+  }
+  if (!strcmp(a, "wx")) { RNS::Utilities::OS::remove_file(SM_WIFI_PATH); sm_change(rid, "update WiFi network removed"); Ph("WiFi network"); Pmsg('o', "Removed: the window uses its own access point."); PL("Back", 'm'); return; }
+  if (!strcmp(a, "wf") || !strcmp(a, "ws")) {
+    SmWifi wf; bool net = sm_wifi_load(wf);
+    Ph("WiFi network"); Pmsg('b', msg);
+    P(DIM("The update window joins it first,\nelse opens its own access point.") "\n");
+    P("Name     "); PF(24, "ws", net ? wf.ssid : ""); P("\nPassword "); P("`<!24|wp`>"); P("\n");
+    PL("Save", 'm', "ws|wp|a=ws"); if (net) { P("  "); PL("Remove", 'm', "a=wx"); } P("  "); PL("Back", 'm');
+    memset(&wf, 0, sizeof wf); return;
   }
 #endif
   Ph("Restart & update"); Pmsg('b', msg);
@@ -1614,7 +1697,12 @@ static void pg_update(const RNS::Bytes& rid) {
 #elif defined(SCOTMESH_WIFI_UPDATE)
   if (!sm_has_ota_slot()) P("This board has one firmware slot:\nupdate over USB.\n");
   else if (!power_ok) Pmsg('b', "Battery low: needs 30% or charging");
-  else { PL("WiFi update", 'm', "a=cw"); P(" " DIM("20 min access point") "\n"); }
+  else {
+    SmWifi wf; bool net = sm_wifi_load(wf);
+    PL("WiFi update", 'm', "a=cw"); P(" " DIM("20 min") "\n");
+    P(DIM("Network") " %s ", net ? wf.ssid : "own AP"); PL("change", 'm', "a=wf"); P("\n");
+    memset(&wf, 0, sizeof wf);
+  }
 #else
   P("This board has one firmware slot:\nupdate over USB.\n");
 #endif
