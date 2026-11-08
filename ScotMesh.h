@@ -4,7 +4,7 @@
 // after over the mesh from its own NomadNet page: public home page with
 // battery, routes/neighbours pages, a small JSON telemetry API that works for
 // unidentified clients, and admin pages (name & announce, home layout,
-// rmap.world position, radio trial, role, power, admins, password
+// shared location, radio trial, role, power, admins, password
 // registration, change log, health, lights & Bluetooth, logs, maintenance,
 // restart and firmware-update windows).
 //
@@ -607,7 +607,8 @@ static void sm_radio_apply(const SmRadio& r) {
 }
 
 // ---------------------------------------------------------------------------
-// rmap.world: Reticulum interface-discovery announce with an LXMF stamp
+// Share location: Reticulum interface-discovery announce with an LXMF stamp
+// (rnstransport.discovery.interface -- rmap.world and meshpoints map it)
 // (cost 16; the 20 x HKDF-256 workblock is exactly 80 SHA-256 blocks, so the
 // hash state after it is computed once and each try is a single block).
 // Worked in slices from the loop; the stamp is cached in flash.
@@ -646,7 +647,7 @@ static void sm_disc_send() {
   RNS::Bytes app; app.append((uint8_t)0x00);
   app.append((const uint8_t*)sm_disc_packed.data(), sm_disc_packed.size()); app.append(sm.stamp, 32);
   sm_disc.announce(app); sm_disc_last = millis();
-  NOTICEF("[discovery] announced %s to rmap.world (%u B app_data)", sm_disc.hash().toHex().c_str(), (unsigned)app.size());
+  NOTICEF("[discovery] announced location %s (%u B app_data)", sm_disc.hash().toHex().c_str(), (unsigned)app.size());
 }
 static void sm_disc_start() {
   if (!sm.map_on || !sm_disc) return;
@@ -1337,7 +1338,7 @@ static int sm_role() {
 }
 static void pg_settings() {
   char r[24], w[16]; snprintf(r, sizeof r, "%s SF%d", sm_mhz(lora_freq), lora_sf); snprintf(w, sizeof w, "below %u%%", sm.pwr_below);
-  Ph("Settings"); P_item("Name & announce", 'n'); P_item("Home page", 'h'); P_item("Map (rmap.world)", 'g', sm.map_on ? "published" : "off");
+  Ph("Settings"); P_item("Name & announce", 'n'); P_item("Home page", 'h'); P_item("Location", 'g', sm.map_on ? "shared" : "off");
   P_item("Radio", 'f', r); P_item("Role", 'w', SM_ROLE_NAME[sm_role()]); P_item("Power", 'y', w); P("\n"); PBACK();
 }
 static void pg_access() {
@@ -1410,16 +1411,16 @@ static void pg_map(const RNS::Bytes& rid) {
     else if (!(h > -500 && h < 9000)) { msg = "Height in metres, e.g. 310"; kind = 'b'; }
     else {
       sm.lat = la; sm.lon = lo; sm.height = (float)std::round(h); sm.map_on = Fis("on", "1"); sm.map_coarse = Fis("pr", "k"); sm_save();
-      sm_change(rid, sm.map_on ? "map position, on" : "map position, off");
+      sm_change(rid, sm.map_on ? "location, shared" : "location, off");
       if (sm.map_on) { sm_disc_start(); msg = "Saved. Announcing."; } else msg = "Saved.";
     }
   }
   if (Vis("a", "an") && sm.map_on) { sm_disc_start(); msg = "Announcing."; }
   char pos[40], ht[8]; snprintf(pos, sizeof pos, "%.5f, %.5f", sm.lat, sm.lon); snprintf(ht, sizeof ht, "%d", (int)sm.height);
-  Ph("Map (rmap.world)"); Pmsg(kind, msg);
+  Ph("Location"); Pmsg(kind, msg);
   P("Paste from Google Maps:\n"); PF(40, "p", pos);
   P("\nHeight "); PF(5, "h", ht); P("m  "); PR("pr", "e", !sm.map_coarse); P(" Exact "); PR("pr", "k", sm.map_coarse); P(" ~1 km\n");
-  PC("on", sm.map_on); P(" Publish on rmap.world\n");
+  PC("on", sm.map_on); P(" Share location (rmap.world, meshpoints)\n");
   if (sm.map_on) {
     if (sm_disc_busy) P("`Fda3Working out the stamp...`f\n");
     else if (sm_disc_last) P("`F2c5Sent %lu min ago`f\n", (unsigned long)((millis() - sm_disc_last) / 60000));
@@ -2215,7 +2216,7 @@ void sm_register(RNS::Destination& dest) {
   for (const char* p : SM_API_PATHS) dest.register_request_handler(p, sm_serve, RNS::Type::Destination::ALLOW_ALL);
   RNS::Transport::register_announce_handler(std::make_shared<SmAnnounceWatch>());
   sm_disc = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "rnstransport", "discovery.interface");
-  sm_disc_due = millis() + 5UL * 60000UL;          // first rmap.world announce 5 min after start
+  sm_disc_due = millis() + 5UL * 60000UL;          // first location (discovery) announce 5 min after start
   sm_nn_due = millis() + sm_ann_ms();              // the start-up announce already went out
 #ifdef SM_LXMF
   sm_lxmf = RNS::Destination(RNS::Transport::identity(), RNS::Type::Destination::IN, RNS::Type::Destination::SINGLE, "lxmf", "delivery");

@@ -56,6 +56,7 @@
 
 ### Changed
 
+- The "Map (rmap.world)" admin page is now called **Location**, its checkbox "Share location (rmap.world, meshpoints)" and the Settings line "Location  shared/off": the location (discovery) announce is heard by every listener, not only rmap.world (meshpoints show it on their Reticulum Dashboard map and in the peer drawer). Text only: the setting, the saved config and the announce are unchanged, so nodes keep their setting across the update. The change log says "location, shared/off", the serial log "announced location". The page still fits one packet (worst case 337 of 409 B).
 - Solar Node P1: the link-pool floor is 15 KB (`-DSM_MIN_POOL_FREE=15360`) instead of the 10 KB default, as measured on a live repeater: about 2 KB per link, and a full day at this floor with up to 21 links open ran without a TX stall.
 - The JSON API is always on. The "Telemetry API" checkbox on the Home page layout page is gone: it switched `/api/...` for everyone (including Node-RED feeds) but changed nothing on the home page, and a disabled API still cost the same link and request airtime.
 - Telemetry page shows sea-level pressure (from the height set on the Map page) instead of an altitude worked out from the standard 1013.25 hPa, which drifted with the weather (an Amsterdam roof read 160 m). `/api/env` keeps its `altitude` field.
